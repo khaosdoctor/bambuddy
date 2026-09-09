@@ -229,6 +229,17 @@ async def scale_poll_loop(config: Config, api: APIClient, shared: dict):
                         last_reported_grams = grams
                     last_report = now
 
+            # Auto-zero: system offset cal when scale confirmed empty (datasheet 8.6.1)
+            if scale.auto_zero_pending:
+                new_tare = await asyncio.to_thread(scale.calibrate_zero)
+                if new_tare is not None:
+                    config.tare_offset = new_tare
+                    await api.update_tare(config.device_id, new_tare)
+
+            # Periodic AFE recalibration (every ~6h)
+            if scale.afe_recal_due:
+                await asyncio.to_thread(scale.recalibrate_afe)
+
             await asyncio.sleep(config.scale_read_interval)
     finally:
         scale.close()
