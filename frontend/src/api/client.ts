@@ -8794,13 +8794,13 @@ export const spoolbuddyApi = {
       body: JSON.stringify({ command }),
     }),
 
-  queueDiagnostics: (deviceId: string, type: 'nfc' | 'scale' | 'read_tag') =>
+  queueDiagnostics: (deviceId: string, type: 'nfc' | 'scale' | 'read_tag' | 'recalibrate') =>
     request<{ status: string; diagnostic: string; message: string }>(
       `/spoolbuddy/diagnostics/${deviceId}/run?diagnostic=${type}`,
       { method: 'POST', body: '{}' }
     ),
 
-  getDiagnosticResult: (deviceId: string, type: 'nfc' | 'scale' | 'read_tag') =>
+  getDiagnosticResult: (deviceId: string, type: 'nfc' | 'scale' | 'read_tag' | 'recalibrate') =>
     request<{ diagnostic: string; success: boolean; output: string; exit_code: number }>(
       `/spoolbuddy/diagnostics/${deviceId}/result?diagnostic=${type}`,
       { method: 'GET' }
