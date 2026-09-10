@@ -57,6 +57,21 @@ class Config:
         if not cfg.hostname:
             cfg.hostname = socket.gethostname()
 
+        # Locally-persisted calibration (survives restarts even if backend returns 0)
+        tare_str = os.environ.get("SPOOLBUDDY_TARE_OFFSET", "").strip()
+        if tare_str:
+            try:
+                cfg.tare_offset = int(tare_str)
+            except ValueError:
+                pass
+
+        cal_str = os.environ.get("SPOOLBUDDY_CALIBRATION_FACTOR", "").strip()
+        if cal_str:
+            try:
+                cfg.calibration_factor = float(cal_str)
+            except ValueError:
+                pass
+
         return cfg
 
 

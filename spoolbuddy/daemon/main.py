@@ -229,13 +229,6 @@ async def scale_poll_loop(config: Config, api: APIClient, shared: dict):
                         last_reported_grams = grams
                     last_report = now
 
-            # Auto-zero: system offset cal when scale confirmed empty (datasheet 8.6.1)
-            if scale.auto_zero_pending:
-                new_tare = await asyncio.to_thread(scale.calibrate_zero)
-                if new_tare is not None:
-                    config.tare_offset = new_tare
-                    await api.update_tare(config.device_id, new_tare)
-
             # Periodic AFE recalibration (every ~6h)
             if scale.afe_recal_due:
                 await asyncio.to_thread(scale.recalibrate_afe)
@@ -283,6 +276,8 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
                     logger.info("Tare executed: offset=%d", new_offset)
                     await api.update_tare(config.device_id, new_offset)
                     config.tare_offset = new_offset
+                    env_path = _spoolbuddy_env_path()
+                    await asyncio.to_thread(_set_env_value, env_path, "SPOOLBUDDY_TARE_OFFSET", str(new_offset))
                 else:
                     logger.warning("Tare command received but scale not available")
                 # Skip calibration sync — this heartbeat response predates the tare
@@ -341,19 +336,7 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
                     else:
                         lines.append("    Internal offset cal: FAILED")
                     lines.append("")
-                    lines.append("[2] System offset calibration (mode=2)...")
-                    lines.append("    WARNING: scale must be empty for accurate results")
-                    scale._auto_zero_pending = True
-                    scale._pending_zero_avg = 0.0
-                    new_tare = await asyncio.to_thread(scale.calibrate_zero)
-                    if new_tare is not None:
-                        config.tare_offset = new_tare
-                        await api.update_tare(config.device_id, new_tare)
-                        lines.append(f"    System offset cal: OK (new tare={new_tare})")
-                    else:
-                        lines.append("    System offset cal: skipped (not pending)")
-                    lines.append("")
-                    lines.append("[3] Reading 5 samples after recalibration...")
+                    lines.append("[2] Reading 5 samples after recalibration...")
                     readings = []
                     for _ in range(5):
                         result_read = await asyncio.to_thread(scale.read)
@@ -465,12 +448,20 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
 
             tare = result.get("tare_offset", config.tare_offset)
             cal = result.get("calibration_factor", config.calibration_factor)
+            # Only accept non-zero backend values (0 means "no data", not "reset")
+            if not tare:
+                tare = config.tare_offset
+            if not cal:
+                cal = config.calibration_factor
             if tare != config.tare_offset or cal != config.calibration_factor:
                 config.tare_offset = tare
                 config.calibration_factor = cal
                 scale = shared.get("scale")
                 if scale:
                     scale.update_calibration(tare, cal)
+                env_path = _spoolbuddy_env_path()
+                _set_env_value(env_path, "SPOOLBUDDY_TARE_OFFSET", str(tare))
+                _set_env_value(env_path, "SPOOLBUDDY_CALIBRATION_FACTOR", str(cal))
                 logger.info("Calibration updated from backend: tare=%d, factor=%.6f", tare, cal)
 
             # Apply display settings from backend
@@ -518,11 +509,32 @@ async def main():
         has_backlight=display.has_backlight,
     )
 
-    # Use server-side calibration if available
+    # Merge server-side calibration with locally-persisted values.
+    # Backend wins when it has non-zero values; local .env wins otherwise
+    # so a "calibrate once" tare survives daemon restarts even if the
+    # backend loses or resets its copy.
     if reg:
-        config.tare_offset = reg.get("tare_offset", config.tare_offset)
-        config.calibration_factor = reg.get("calibration_factor", config.calibration_factor)
+        backend_tare = reg.get("tare_offset", 0)
+        backend_cal = reg.get("calibration_factor", 0.0)
+
+        if backend_tare:
+            config.tare_offset = backend_tare
+        if backend_cal:
+            config.calibration_factor = backend_cal
+
         scale.update_calibration(config.tare_offset, config.calibration_factor)
+
+        # Persist the resolved values locally
+        env_path = _spoolbuddy_env_path()
+        if config.tare_offset:
+            _set_env_value(env_path, "SPOOLBUDDY_TARE_OFFSET", str(config.tare_offset))
+        if config.calibration_factor != 1.0:
+            _set_env_value(env_path, "SPOOLBUDDY_CALIBRATION_FACTOR", str(config.calibration_factor))
+
+        # Push local tare to backend if backend had 0 but we have a stored value
+        if not backend_tare and config.tare_offset:
+            logger.info("Backend has no tare, pushing local tare=%d", config.tare_offset)
+            await api.update_tare(config.device_id, config.tare_offset)
 
         # Auto-deploy Bambuddy's SSH public key for remote updates
         ssh_key = reg.get("ssh_public_key")
