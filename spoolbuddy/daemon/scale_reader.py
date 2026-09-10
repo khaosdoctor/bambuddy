@@ -1,6 +1,7 @@
 """Scale reader wrapper with stability detection and periodic recalibration."""
 
 import logging
+import threading
 import time
 from collections import deque
 
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 MOVING_AVG_SIZE = 20
 
 AFE_RECAL_INTERVAL_S = 6 * 3600
+AFE_RECAL_RETRY_S = 300
 
 
 class ScaleReader:
@@ -20,6 +22,7 @@ class ScaleReader:
         self._stability_history: deque[tuple[float, float]] = deque(maxlen=20)
         self._ok = False
         self._last_raw = 0
+        self._hw_lock = threading.Lock()
 
         self._last_afe_recal: float = time.monotonic()
 
@@ -61,12 +64,13 @@ class ScaleReader:
 
     def tare(self):
         """Set current raw reading as tare offset."""
-        if self._last_raw:
-            self._tare_offset = self._last_raw
-            self._samples.clear()
-            self._stability_history.clear()
-            logger.info("Tared at raw=%d", self._tare_offset)
-        return self._tare_offset
+        with self._hw_lock:
+            if self._last_raw:
+                self._tare_offset = self._last_raw
+                self._samples.clear()
+                self._stability_history.clear()
+                logger.info("Tared at raw=%d", self._tare_offset)
+            return self._tare_offset
 
     @property
     def afe_recal_due(self) -> bool:
@@ -85,50 +89,86 @@ class ScaleReader:
         """
         if not self._scale:
             return False
-        try:
-            self._scale.calibrate_afe(timeout_ms=1000, mode=0)
-            self._scale.flush_readings(count=2, timeout_s=1.0)
-            self._samples.clear()
-            self._stability_history.clear()
-            self._last_afe_recal = time.monotonic()
-            logger.info("Periodic internal offset cal complete")
-            return True
-        except Exception as e:
-            logger.warning("Internal offset cal failed: %s", e)
-            return False
+        with self._hw_lock:
+            try:
+                self._scale.calibrate_afe(timeout_ms=1000, mode=0)
+                self._scale.flush_readings(count=2, timeout_s=1.0)
+                self._samples.clear()
+                self._stability_history.clear()
+                self._last_afe_recal = time.monotonic()
+                logger.info("Periodic internal offset cal complete")
+                return True
+            except Exception as e:
+                self._last_afe_recal = time.monotonic() - AFE_RECAL_INTERVAL_S + AFE_RECAL_RETRY_S
+                logger.warning("Internal offset cal failed (retry in %ds): %s", AFE_RECAL_RETRY_S, e)
+                return False
 
     def read(self) -> tuple[float, bool, int] | None:
         """Read current weight. Returns (grams, stable, raw_adc) or None."""
-        try:
-            if not self._scale.data_ready():
+        with self._hw_lock:
+            try:
+                if not self._scale.data_ready():
+                    return None
+
+                raw = self._scale.read_raw()
+                self._last_raw = raw
+                self._ok = True
+
+                grams = (raw - self._tare_offset) * self._calibration_factor
+                self._samples.append(grams)
+
+                # Moving average
+                avg_grams = sum(self._samples) / len(self._samples)
+
+                # Stability: track readings over time
+                now = time.monotonic()
+                self._stability_history.append((now, avg_grams))
+
+                # Stable if all readings within 1s window are within 2g of each other
+                stable = False
+                if len(self._stability_history) >= 5:
+                    cutoff = now - 1.0
+                    recent = [g for t, g in self._stability_history if t >= cutoff]
+                    if len(recent) >= 3:
+                        spread = max(recent) - min(recent)
+                        stable = spread < 2.0
+
+                return round(avg_grams, 1), stable, raw
+
+            except Exception as e:
+                logger.debug("Scale read error: %s", e)
+                self._ok = False
                 return None
 
-            raw = self._scale.read_raw()
-            self._last_raw = raw
-            self._ok = True
+    def read_wait(self, timeout_s: float = 0.5) -> tuple[float, bool, int] | None:
+        """Wait for a conversion then read. For diagnostics that need guaranteed samples."""
+        with self._hw_lock:
+            try:
+                if not self._scale or not self._scale.wait_data_ready(timeout_s=timeout_s):
+                    return None
 
-            grams = (raw - self._tare_offset) * self._calibration_factor
-            self._samples.append(grams)
+                raw = self._scale.read_raw()
+                self._last_raw = raw
+                self._ok = True
 
-            # Moving average
-            avg_grams = sum(self._samples) / len(self._samples)
+                grams = (raw - self._tare_offset) * self._calibration_factor
+                self._samples.append(grams)
+                avg_grams = sum(self._samples) / len(self._samples)
 
-            # Stability: track readings over time
-            now = time.monotonic()
-            self._stability_history.append((now, avg_grams))
+                now = time.monotonic()
+                self._stability_history.append((now, avg_grams))
 
-            # Stable if all readings within 1s window are within 2g of each other
-            stable = False
-            if len(self._stability_history) >= 5:
-                cutoff = now - 1.0
-                recent = [g for t, g in self._stability_history if t >= cutoff]
-                if len(recent) >= 3:
-                    spread = max(recent) - min(recent)
-                    stable = spread < 2.0
+                stable = False
+                if len(self._stability_history) >= 5:
+                    cutoff = now - 1.0
+                    recent = [g for t, g in self._stability_history if t >= cutoff]
+                    if len(recent) >= 3:
+                        spread = max(recent) - min(recent)
+                        stable = spread < 2.0
 
-            return round(avg_grams, 1), stable, raw
+                return round(avg_grams, 1), stable, raw
 
-        except Exception as e:
-            logger.debug("Scale read error: %s", e)
-            self._ok = False
-            return None
+            except Exception as e:
+                logger.debug("Scale read_wait error: %s", e)
+                self._ok = False
+                return None
