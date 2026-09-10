@@ -229,6 +229,17 @@ async def scale_poll_loop(config: Config, api: APIClient, shared: dict):
                         last_reported_grams = grams
                     last_report = now
 
+            # Auto-zero: system offset cal when scale confirmed empty (datasheet 8.6.1)
+            if scale.auto_zero_pending:
+                new_tare = await asyncio.to_thread(scale.calibrate_zero)
+                if new_tare is not None:
+                    config.tare_offset = new_tare
+                    await api.update_tare(config.device_id, new_tare)
+
+            # Periodic AFE recalibration (every ~6h)
+            if scale.afe_recal_due:
+                await asyncio.to_thread(scale.recalibrate_afe)
+
             await asyncio.sleep(config.scale_read_interval)
     finally:
         scale.close()
@@ -313,6 +324,57 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
                         False,
                         str(e),
                     )
+                continue
+            elif cmd == "run_recalibrate_diag":
+                scale = shared.get("scale")
+                lines = []
+                success = False
+                if not scale or not scale.ok:
+                    lines.append("Scale not available")
+                else:
+                    lines.append("=== Scale Recalibration ===")
+                    lines.append("")
+                    lines.append("[1] Internal offset calibration (mode=0)...")
+                    afe_ok = await asyncio.to_thread(scale.recalibrate_afe)
+                    if afe_ok:
+                        lines.append("    Internal offset cal: OK")
+                    else:
+                        lines.append("    Internal offset cal: FAILED")
+                    lines.append("")
+                    lines.append("[2] System offset calibration (mode=2)...")
+                    lines.append("    WARNING: scale must be empty for accurate results")
+                    scale._auto_zero_pending = True
+                    scale._pending_zero_avg = 0.0
+                    new_tare = await asyncio.to_thread(scale.calibrate_zero)
+                    if new_tare is not None:
+                        config.tare_offset = new_tare
+                        await api.update_tare(config.device_id, new_tare)
+                        lines.append(f"    System offset cal: OK (new tare={new_tare})")
+                    else:
+                        lines.append("    System offset cal: skipped (not pending)")
+                    lines.append("")
+                    lines.append("[3] Reading 5 samples after recalibration...")
+                    readings = []
+                    for _ in range(5):
+                        result_read = await asyncio.to_thread(scale.read)
+                        if result_read:
+                            grams, stable, raw = result_read
+                            readings.append((grams, stable, raw))
+                            lines.append(f"    {grams:>8.1f}g  raw={raw}  {'stable' if stable else 'unstable'}")
+                        else:
+                            lines.append("    (no reading)")
+                    if readings:
+                        avg = sum(r[0] for r in readings) / len(readings)
+                        spread = max(r[0] for r in readings) - min(r[0] for r in readings)
+                        lines.append(f"    Average: {avg:.1f}g  Spread: {spread:.1f}g")
+                    lines.append("")
+                    lines.append("Recalibration complete.")
+                    success = afe_ok
+                output = "\n".join(lines)
+                logger.info("Recalibration diagnostic: %s", "OK" if success else "FAILED")
+                await api.diagnostic_result(
+                    config.device_id, "recalibrate", success, output, 0 if success else 1
+                )
                 continue
             elif cmd in ("run_nfc_diag", "run_scale_diag", "run_read_tag_diag"):
                 if cmd == "run_scale_diag":

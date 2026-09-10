@@ -20,11 +20,13 @@ import {
   RefreshCw,
   RotateCw,
   Power,
+  Scale as ScaleIcon,
 } from 'lucide-react';
 import { spoolbuddyApi, type SpoolBuddyDevice } from '../api/client';
 import { Card, CardContent, CardHeader } from './Card';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
+import { DiagnosticModal } from './spoolbuddy/DiagnosticModal';
 import { useToast } from '../contexts/ToastContext';
 import { formatRelativeTime } from '../utils/date';
 
@@ -63,6 +65,7 @@ function DeviceCard({ device, onUnregister, isDeleting }: DeviceCardProps) {
   const online = device.online;
   const [pendingAction, setPendingAction] = useState<ActionKey | null>(null);
   const [busyAction, setBusyAction] = useState<ActionKey | null>(null);
+  const [diagnosticOpen, setDiagnosticOpen] = useState<'recalibrate' | null>(null);
 
   const runAction = async (action: ActionKey) => {
     setBusyAction(action);
@@ -204,6 +207,16 @@ function DeviceCard({ device, onUnregister, isDeleting }: DeviceCardProps) {
             )}
             {t('settings.spoolbuddy.scale')}
           </span>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setDiagnosticOpen('recalibrate')}
+            disabled={!online}
+            aria-label={t('settings.spoolbuddy.recalibrateScale', 'Recalibrate Scale')}
+          >
+            <ScaleIcon className="w-3.5 h-3.5" />
+            <span>{t('settings.spoolbuddy.recalibrateScale', 'Recalibrate Scale')}</span>
+          </Button>
         </div>
 
         {/* System stats */}
@@ -284,6 +297,13 @@ function DeviceCard({ device, onUnregister, isDeleting }: DeviceCardProps) {
           isLoading={busyAction !== null}
           onConfirm={() => runAction(pendingAction)}
           onCancel={() => setPendingAction(null)}
+        />
+      )}
+      {diagnosticOpen && (
+        <DiagnosticModal
+          type={diagnosticOpen}
+          deviceId={device.device_id}
+          onClose={() => setDiagnosticOpen(null)}
         />
       )}
     </Card>
