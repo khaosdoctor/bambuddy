@@ -339,7 +339,7 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
                     lines.append("[2] Reading 5 samples after recalibration...")
                     readings = []
                     for _ in range(5):
-                        result_read = await asyncio.to_thread(scale.read)
+                        result_read = await asyncio.to_thread(scale.read_wait, 0.5)
                         if result_read:
                             grams, stable, raw = result_read
                             readings.append((grams, stable, raw))
