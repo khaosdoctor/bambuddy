@@ -13,6 +13,7 @@ export default {
     files: 'File Manager',
     makerworld: 'MakerWorld',
     notifications: 'Notifications',
+    spoolbuddy: 'SpoolBuddy',
     settings: 'Settings',
     system: 'System',
     collapseSidebar: 'Collapse sidebar',

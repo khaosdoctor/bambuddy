@@ -767,6 +767,7 @@ export function Layout() {
               {/* Bottom row: version */}
               <div className="flex items-center justify-center gap-2">
                 <span className="text-sm text-bambu-gray">v{versionInfo?.version || '...'}</span>
+                <span className="text-xs font-semibold text-yellow-400">fork</span>
                 {updateCheck?.update_available && (
                   <button
                     onClick={() => navigate('/settings')}
