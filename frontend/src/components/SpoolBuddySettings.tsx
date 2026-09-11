@@ -21,7 +21,9 @@ import {
   RotateCw,
   Power,
   Scale as ScaleIcon,
+  ExternalLink,
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { spoolbuddyApi, type SpoolBuddyDevice } from '../api/client';
 import { Card, CardContent, CardHeader } from './Card';
 import { Button } from './Button';
@@ -359,6 +361,13 @@ export function SpoolBuddySettings() {
           </div>
         </CardContent>
       </Card>
+
+      <Link to="/spoolbuddy">
+        <Button className="w-full">
+          <ExternalLink className="w-4 h-4" />
+          {t('settings.spoolbuddy.openUI', { defaultValue: 'Open SpoolBuddy UI' })}
+        </Button>
+      </Link>
 
       {hasDuplicates && (
         <Card className="border-l-4 border-l-yellow-500">
