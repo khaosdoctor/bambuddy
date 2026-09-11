@@ -1,7 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useQuery, useQueries } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { WifiOff } from 'lucide-react';
+import { WifiOff, ArrowLeft } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { api, type Printer } from '../../api/client';
 import { formatTimeOnly } from '../../utils/date';
 
@@ -54,8 +55,11 @@ export function SpoolBuddyTopBar({ selectedPrinterId, onPrinterChange, deviceOnl
 
   return (
     <div className="h-12 bg-bambu-dark-secondary border-b border-bambu-dark-tertiary flex items-center px-3 gap-4 shrink-0">
-      {/* Logo */}
-      <div className="flex items-center shrink-0">
+      {/* Back to Bambuddy + Logo */}
+      <div className="flex items-center gap-2 shrink-0">
+        <Link to="/" className="p-1.5 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-white/50 hover:text-white" title={t('spoolbuddy.nav.backToBambuddy', 'Back to Bambuddy')}>
+          <ArrowLeft className="w-5 h-5" />
+        </Link>
         <img src="/img/spoolbuddy_logo_dark_small.png" alt="SpoolBuddy" width={113} height={28} className="h-7 w-auto" />
       </div>
 
