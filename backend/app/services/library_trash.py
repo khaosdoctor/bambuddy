@@ -29,6 +29,7 @@ from backend.app.core.database import async_session
 from backend.app.models.library import LibraryFile
 from backend.app.models.print_queue import PrintQueueItem, PrintQueueVariant
 from backend.app.models.settings import Settings
+from backend.app.utils.library_paths import remove_library_photos_dir
 from backend.app.utils.local_time import utcnow_naive
 
 logger = logging.getLogger(__name__)
@@ -364,7 +365,7 @@ class LibraryTrashService:
 
     @staticmethod
     def _unlink_on_disk(row: LibraryFile) -> None:
-        """Best-effort cleanup of the file + thumbnail on disk."""
+        """Best-effort cleanup of the file, thumbnail and photos (#3077) on disk."""
         for rel in (row.file_path, row.thumbnail_path):
             abs_path = _to_absolute_path(rel)
             if abs_path is None:
@@ -374,6 +375,7 @@ class LibraryTrashService:
                     abs_path.unlink()
             except OSError as e:
                 logger.warning("Trash sweep: failed to unlink %s: %s", abs_path, e)
+        remove_library_photos_dir(row.id)
 
     # ---- User-facing trash ops ----------------------------------------
 
@@ -416,7 +418,9 @@ async def release_queue_references(db: AsyncSession, file_ids: list[int]) -> int
 
     Rows already printing are left in place. One of those is a job on a machine
     right now; the file being deleted is the copy in the library, not the copy
-    the printer is working from. Returns the number of items cancelled.
+    the printer is working from. The files' remaining ON DELETE rules (archives
+    printed from them lose the link) apply at the delete itself, on SQLite
+    through core/sqlite_fk. Returns the number of items cancelled.
     """
     if not file_ids:
         return 0
@@ -459,6 +463,13 @@ async def release_queue_references(db: AsyncSession, file_ids: list[int]) -> int
                 )
             )
         logger.info("Library delete: cancelled %d queued item(s) whose file was removed", len(rows))
+        # A grouping left with only cancelled jobs is finished. Not on the bare
+        # connection the start-up orphan sweep passes: the batch backfill that
+        # runs at start-up re-checks every batch anyway.
+        if isinstance(db, AsyncSession):
+            from backend.app.services.print_batch import refresh_batches_for_items
+
+            await refresh_batches_for_items(db, [item_id for ids in doomed.values() for item_id in ids])
 
     await db.execute(
         PrintQueueItem.__table__.update()

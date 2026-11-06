@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Bell, Trash2, Settings2, Edit2, Send, Loader2, CheckCircle, XCircle, Moon, Clock, ChevronDown, ChevronUp, Calendar } from 'lucide-react';
+import { Bell, Trash2, Settings2, Edit2, Send, Loader2, CheckCircle, XCircle, Moon, Clock, ChevronDown, ChevronUp, Calendar, Camera, CameraOff } from 'lucide-react';
 import { api } from '../api/client';
 import { formatDateOnly, parseUTCDate } from '../utils/date';
 import type { NotificationProvider, NotificationProviderUpdate } from '../api/client';
@@ -9,6 +9,7 @@ import { Card, CardContent } from './Card';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
 import { Toggle } from './Toggle';
+import { isNotifyPushOnlyTarget, isNotifyPhotoUnsupported } from '../utils/notify';
 
 interface NotificationProviderCardProps {
   provider: NotificationProvider;
@@ -27,6 +28,8 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
     queryKey: ['printers'],
     queryFn: api.getPrinters,
   });
+
+  const notifyPhotosUnsupported = provider.provider_type === 'notify' && isNotifyPhotoUnsupported(String(provider.config.device_id || ''));
 
   const linkedPrinter = printers?.find(p => p.id === provider.printer_id);
 
@@ -114,6 +117,12 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
 
           {/* Event summary - show all event tags */}
           <div className="mb-3 flex flex-wrap gap-1">
+            {provider.provider_type === 'notify' && provider.config.live_activities === true && !isNotifyPushOnlyTarget(String(provider.config.device_id || '')) && (
+              <span className="px-2 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 text-xs rounded">{t('notifications.notifyLiveActivities')}</span>
+            )}
+            {provider.provider_type === 'notify' && provider.config.lock_screen_widgets === true && !isNotifyPushOnlyTarget(String(provider.config.device_id || '')) && (
+              <span className="px-2 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 text-xs rounded">{t('notifications.notifyLockScreenWidgets')}</span>
+            )}
             {provider.on_print_start && (
               <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 text-xs rounded">{t('notifications.start')}</span>
             )}
@@ -125,6 +134,15 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
             )}
             {provider.on_plate_clear_required && (
               <span className="px-2 py-0.5 bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400 text-xs rounded">{t('notifications.plateClear')}</span>
+            )}
+            {provider.on_print_confirm_request && (
+              <span className="px-2 py-0.5 bg-teal-100 dark:bg-teal-500/20 text-teal-700 dark:text-teal-400 text-xs rounded">{t('notifications.printConfirmRequest')}</span>
+            )}
+            {provider.provider_type === 'telegram' && provider.on_print_confirm_request && provider.telegram_verdict_mode === 'reactions' && (
+              <span className="px-2 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 text-xs rounded">{t('notifications.telegramVerdictBadgeReactions')}</span>
+            )}
+            {provider.provider_type === 'telegram' && provider.on_print_confirm_request && provider.telegram_verdict_mode === 'both' && (
+              <span className="px-2 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 text-xs rounded">{t('notifications.telegramVerdictBadgeBoth')}</span>
             )}
             {provider.on_print_failed && (
               <span className="px-2 py-0.5 bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400 text-xs rounded">{t('notifications.failed')}</span>
@@ -180,6 +198,12 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
             {provider.on_first_layer_complete && (
               <span className="px-2 py-0.5 bg-emerald-100 dark:bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 text-xs rounded">{t('notifications.firstLayer')}</span>
             )}
+            {provider.on_print_pause_upcoming && (
+              <span className="px-2 py-0.5 bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400 text-xs rounded">{t('notifications.pauseUpcomingBadge')}</span>
+            )}
+            {provider.on_app_message && (
+              <span className="px-2 py-0.5 bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400 text-xs rounded">{t('notifications.appMessagesBadge')}</span>
+            )}
             {provider.on_print_missing_spool_assignment && (
               <span className="px-2 py-0.5 bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-300 text-xs rounded">{t('notifications.missingSpoolAssignmentLabel')}</span>
             )}
@@ -199,6 +223,12 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
               <span className="px-2 py-0.5 bg-emerald-100 dark:bg-emerald-500/20 text-emerald-700 dark:text-emerald-400 text-xs rounded flex items-center gap-1">
                 <Calendar className="w-3 h-3" />
                 {t('notifications.digest', { time: provider.daily_digest_time })}
+              </span>
+            )}
+            {(provider.attach_photo === false || notifyPhotosUnsupported) && (
+              <span className="px-2 py-0.5 bg-bambu-dark-tertiary text-bambu-gray text-xs rounded flex items-center gap-1">
+                <CameraOff className="w-3 h-3" />
+                {t('notifications.noPhoto')}
               </span>
             )}
           </div>
@@ -316,6 +346,17 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
 
                 <div className="flex items-center justify-between">
                   <div>
+                    <p className="text-sm text-white">{t('notifications.printConfirmRequest')}</p>
+                    <p className="text-xs text-bambu-gray">{t('notifications.printConfirmRequestDescription')}</p>
+                  </div>
+                  <Toggle
+                    checked={provider.on_print_confirm_request ?? true}
+                    onChange={(checked) => updateMutation.mutate({ on_print_confirm_request: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
                     <p className="text-sm text-white">{t('notifications.bedCooledLabel')}</p>
                     <p className="text-xs text-bambu-gray">{t('notifications.bedCooledDescription')}</p>
                   </div>
@@ -333,6 +374,17 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                   <Toggle
                     checked={provider.on_first_layer_complete ?? false}
                     onChange={(checked) => updateMutation.mutate({ on_first_layer_complete: checked })}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-white">{t('notifications.pauseUpcomingLabel')}</p>
+                    <p className="text-xs text-bambu-gray">{t('notifications.pauseUpcomingDescription')}</p>
+                  </div>
+                  <Toggle
+                    checked={provider.on_print_pause_upcoming ?? false}
+                    onChange={(checked) => updateMutation.mutate({ on_print_pause_upcoming: checked })}
                   />
                 </div>
 
@@ -631,6 +683,17 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                     onChange={(checked) => updateMutation.mutate({ on_queue_completed: checked })}
                   />
                 </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-white">{t('notifications.appMessages')}</p>
+                    <p className="text-xs text-bambu-gray">{t('notifications.appMessagesDescription')}</p>
+                  </div>
+                  <Toggle
+                    checked={provider.on_app_message ?? false}
+                    onChange={(checked) => updateMutation.mutate({ on_app_message: checked })}
+                  />
+                </div>
               </div>
 
               {/* Quiet Hours */}
@@ -685,6 +748,22 @@ export function NotificationProviderCard({ provider, onEdit }: NotificationProvi
                     <p className="text-xs text-bambu-gray">{t('notifications.editProviderToChangeDigestTime')}</p>
                   </div>
                 )}
+              </div>
+
+              {/* Attach Photo */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Camera className="w-4 h-4 text-bambu-gray" />
+                  <div>
+                    <p className="text-sm text-white">{t('notifications.attachPhotoLabel')}</p>
+                    <p className="text-xs text-bambu-gray">{t(notifyPhotosUnsupported ? 'notifications.notifyPhotoUnavailable' : 'notifications.attachPhotoDescription')}</p>
+                  </div>
+                </div>
+                <Toggle
+                  checked={!notifyPhotosUnsupported && (provider.attach_photo ?? true)}
+                  disabled={notifyPhotosUnsupported}
+                  onChange={(checked) => updateMutation.mutate({ attach_photo: checked })}
+                />
               </div>
 
               {/* Action Buttons */}

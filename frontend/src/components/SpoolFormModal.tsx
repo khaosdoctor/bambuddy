@@ -1,9 +1,9 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { X, Loader2, Save, Beaker, Palette, Zap, Tag, Unlink } from 'lucide-react';
+import { X, Loader2, Save, Beaker, Palette, Zap, Tag, Link2, Unlink } from 'lucide-react';
 import { api, ApiError } from '../api/client';
-import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolFilamentPresetInput, SpoolKProfileInput, SpoolmanFilamentEntry } from '../api/client';
+import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolFilamentPresetInput, SpoolKProfileInput, SpoolmanFilamentEntry, ResolvedProfileDefault } from '../api/client';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
 import type {
@@ -15,19 +15,24 @@ import type {
   SpoolFormMode,
 } from './spool-form/types';
 import { defaultFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
-import { buildFilamentOptions, extractBrandsFromPresets, fetchPrinterCalibrations, findPresetOption, hotendKey, loadRecentColors, pairedOptions, parsePresetKey, parsePresetName, presetKey, saveRecentColor, withCurrentValue } from './spool-form/utils';
+import { buildFilamentOptions, extractBrandsFromPresets, fetchPrinterCalibrations, findPresetOption, loadRecentColors, pairedOptions, parsePresetKey, parsePresetName, presetKey, saveRecentColor, selectionFromKProfiles, withCurrentValue } from './spool-form/utils';
 import { MATERIALS } from './spool-form/constants';
 import { FilamentSection } from './spool-form/FilamentSection';
 import { ColorSection } from './spool-form/ColorSection';
 import { AdditionalSection } from './spool-form/AdditionalSection';
+import { SupplierSection, type SupplierLinkDraft } from './spool-form/SupplierSection';
 import { SpoolmanFilamentPicker } from './spool-form/SpoolmanFilamentPicker';
 import { PrinterProfilesSection } from './spool-form/PrinterProfilesSection';
+import { ProfileDefaultOption, type ProfileDefaultScope } from './spool-form/ProfileDefaultOption';
 import { normaliseFlow } from '../utils/nozzleFlow';
+import { parseUTCDate, toDateTimeLocalValue } from '../utils/date';
 import { SpoolUsageHistory } from './SpoolUsageHistory';
+import { AssignToAmsModal } from './spoolbuddy/AssignToAmsModal';
 import {
   invalidateInventoryLocations,
   invalidateSpoolAndLocationQueries,
 } from '../utils/inventoryQueries';
+import { useUiSettings } from '../hooks/useUiSettings';
 
 type TabId = 'filament' | 'appearance' | 'printers';
 
@@ -72,12 +77,34 @@ export function SpoolFormModal({
 
   // Form state
   const [formData, setFormData] = useState<SpoolFormData>(defaultFormData);
+  const formDataRef = useRef(formData);
+  formDataRef.current = formData;
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [activeTab, setActiveTab] = useState<TabId>('filament');
   const [weightTouched, setWeightTouched] = useState(false);
+  // Keyed on core_weight, not core_weight_catalog_id: SpoolWeightPicker selects
+  // a catalogue entry by itself on mount when one matches the current weight,
+  // so the id changes on forms nobody has touched. Both real user actions go
+  // through core_weight.
+  const [coreWeightTouched, setCoreWeightTouched] = useState(false);
   const [locationIdTouched, setLocationIdTouched] = useState(false);
+  // Sent only when changed, so saving an unrelated edit cannot put back a
+  // drying date that an AMS run stamped while the form was open (#2863).
+  const [lastDriedTouched, setLastDriedTouched] = useState(false);
+  // Supplier assignments (#2988). Held outside SpoolFormData — they are
+  // relational and saved through their own replace-all endpoint. An untouched
+  // create does not send them, so it keeps the backend's inherited
+  // assignments instead of wiping them with an empty list; a copy always
+  // sends them, see saveSupplierLinks.
+  const [supplierLinks, setSupplierLinks] = useState<SupplierLinkDraft[]>([]);
+  const [supplierLinksTouched, setSupplierLinksTouched] = useState(false);
   const [quickAdd, setQuickAdd] = useState(false);
   const [quantity, setQuantity] = useState(1);
+  const [showAssignModal, setShowAssignModal] = useState(false);
+
+  useEffect(() => {
+    setShowAssignModal(false);
+  }, [isOpen, spool?.id]);
 
   // Cloud presets
   const [cloudAuthenticated, setCloudAuthenticated] = useState(false);
@@ -129,6 +156,48 @@ export function SpoolFormModal({
   // backend cascade does with a missing row.
   const [modelPresets, setModelPresets] = useState<Map<string, PresetChoice>>(new Map());
   const [selectedGroupId, setSelectedGroupId] = useState<string>('');
+  // Profile defaults (#1326). Whether the user changed anything on the
+  // Printers tab: an untouched create does not save the tab, so it keeps the
+  // profile default the backend applies instead of wiping it with an empty
+  // list -- the same rule as the supplier assignments.
+  const [printerProfilesTouched, setPrinterProfilesTouched] = useState(false);
+  // The tab (and an empty preset field) was filled in from the product's default.
+  const [prefilledFromDefault, setPrefilledFromDefault] = useState(false);
+  // What the default put in, per hotend and per (model, nozzle), so the next
+  // product's default can take back what the user left as it was.
+  const kFromDefault = useRef<Map<string, CalibrationProfile>>(new Map());
+  const presetsFromDefault = useRef<Map<string, PresetChoice>>(new Map());
+  // Hotends and (model, nozzle) keys the user set or cleared on the tab: theirs,
+  // so a later default never puts back what they removed.
+  const userKKeys = useRef<Set<string>>(new Set());
+  const userPresetKeys = useRef<Set<string>>(new Set());
+  // A ref, not state: the lookup's answer arrives after the render that asked
+  // for it, and must see a preset the user picked in the meantime.
+  const presetFromDefault = useRef(false);
+  const [saveAsDefault, setSaveAsDefault] = useState(false);
+  const [defaultScope, setDefaultScope] = useState<ProfileDefaultScope>('all');
+  // The Printers tab's own setters mark it touched; the loaders here use the raw ones.
+  const markChanged = <V,>(prev: Map<string, V>, next: Map<string, V>, keys: Set<string>) => {
+    for (const key of new Set([...prev.keys(), ...next.keys()])) {
+      if (prev.get(key) !== next.get(key)) keys.add(key);
+    }
+  };
+  const editModelPresets: typeof setModelPresets = (value) => {
+    setPrinterProfilesTouched(true);
+    setModelPresets(prev => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      markChanged(prev, next, userPresetKeys.current);
+      return next;
+    });
+  };
+  const editSelectedProfiles: typeof setSelectedProfiles = (value) => {
+    setPrinterProfilesTouched(true);
+    setSelectedProfiles(prev => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      markChanged(prev, next, userKKeys.current);
+      return next;
+    });
+  };
 
   // Use prop if provided, otherwise use self-fetched data
   const resolvedCalibrations = printersWithCalibrations.length > 0
@@ -206,9 +275,9 @@ export function SpoolFormModal({
         }
       };
       fetchData();
-      if (!spoolmanMode) {
-        api.getSpoolCatalog().then(setSpoolCatalog).catch(console.error);
-      }
+      // Fetched in Spoolman mode too: the empty spool weight picker is shown
+      // there now, and its catalogue is Bambuddy's own either way (#2908).
+      api.getSpoolCatalog().then(setSpoolCatalog).catch(console.error);
       api.getColorCatalog().then(setColorCatalog).catch(console.error);
       api.getLocalPresets().then(r => setLocalPresets(r.filament)).catch(console.error);
       api.getBuiltinFilaments().then(setBuiltinFilaments).catch(console.error);
@@ -255,16 +324,14 @@ export function SpoolFormModal({
         })();
       }
     }
-    // The effect intentionally depends only on `isOpen` (and the prop-side
-    // calibration count) — re-running on every spoolmanMode toggle would
-    // race the in-flight async fetches with unmount/teardown and emit
-    // "test environment was torn down" errors in vitest. spoolmanMode only
-    // gates a single fetch (getSpoolCatalog) which is cheap enough to skip
-    // when the modal opens in Spoolman mode.
+    // Depends only on `isOpen` (and the prop-side calibration count). It used
+    // to read spoolmanMode for the catalogue fetch and left it out of the deps
+    // on purpose -- re-running on every toggle raced the in-flight fetches with
+    // unmount and emitted "test environment was torn down" errors in vitest.
+    // It no longer reads it, so the deps are complete as written.
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, printersWithCalibrations.length]);
 
   // Build filament options: cloud → local → fallback
@@ -402,7 +469,8 @@ export function SpoolFormModal({
           extra_colors: spool.extra_colors || '',
           effect_type: spool.effect_type || '',
           label_weight: spool.label_weight || 1000,
-          core_weight: spool.core_weight || 250,
+          // ?? not ||: 0 g is a real tare (a spool-less coil) and must load as 0.
+          core_weight: spool.core_weight ?? 250,
           core_weight_catalog_id: spool.core_weight_catalog_id ?? null,
           weight_used: isCopying ? 0 : spool.weight_used || 0,
           slicer_filament: spool.slicer_filament || '',
@@ -410,42 +478,35 @@ export function SpoolFormModal({
           cost_per_kg: spool.cost_per_kg ?? null,
           category: spool.category || '',
           low_stock_threshold_pct: spool.low_stock_threshold_pct ?? null,
+          material_number: spool.material_number || '',
           location_id: spool.location_id ?? null,
+          last_dried_at: (() => {
+            const dried = isCopying ? null : parseUTCDate(spool.last_dried_at);
+            return dried ? toDateTimeLocalValue(dried) : '';
+          })(),
           spoolman_filament_id: null,
         });
         setPresetInputValue(spool.slicer_filament_name || spool.slicer_filament || '');
 
-        // Load K-profiles for this spool. The stored row carries everything
-        // the picker needs to show the selection before the printer answers,
-        // so an offline printer still renders what was chosen for it.
-        if (spool.k_profiles && spool.k_profiles.length > 0) {
-          const chosen = new Map<string, CalibrationProfile>();
-          for (const p of spool.k_profiles) {
-            if (p.cali_idx === null || p.cali_idx === undefined) continue;
-            const diameter = (p.nozzle_diameter || '').trim() || '0.4';
-            const extruder = p.extruder ?? 0;
-            chosen.set(hotendKey(p.printer_id, extruder, diameter), {
-              cali_idx: p.cali_idx,
-              filament_id: '',
-              setting_id: p.setting_id || '',
-              name: p.name || '',
-              k_value: p.k_value,
-              n_coef: 0,
-              extruder_id: extruder,
-              nozzle_diameter: diameter,
-              // Stored as the bare flow code; the picker re-derives its label
-              // from the same field it reads off a live profile.
-              nozzle_id: p.nozzle_type || '',
-            });
-          }
-          setSelectedProfiles(chosen);
-        } else {
-          setSelectedProfiles(new Map());
-        }
+        // Load K-profiles for this spool.
+        setSelectedProfiles(selectionFromKProfiles(spool.k_profiles ?? []));
+        // Supplier assignments (#2988) — copied on copy: they describe where
+        // the product is bought, which is what a copy shares.
+        setSupplierLinks(
+          (spool.suppliers ?? []).map((link) => ({
+            supplier_id: link.supplier_id,
+            supplier_name: link.supplier_name,
+            supplier_article_number: link.supplier_article_number ?? '',
+            quoted_price_per_kg: link.quoted_price_per_kg,
+            // Where a COPY was bought is unknown — only a real edit keeps it.
+            is_purchase_source: isCopying ? false : link.is_purchase_source,
+          }))
+        );
       } else {
         setFormData(defaultFormData);
         setPresetInputValue('');
         setSelectedProfiles(new Map());
+        setSupplierLinks([]);
       }
       // Reset on every open, not just the create path (#1905). The modal keeps
       // its state while closed, and the Quick Add toggle only renders in create
@@ -462,7 +523,22 @@ export function SpoolFormModal({
       // save) A's per-model overrides on B. Refilled by the fetch below.
       setModelPresets(new Map());
       setWeightTouched(false);
+      setLastDriedTouched(false);
+      // A copy of a Spoolman spool with its own tare carries that tare, as it
+      // would any other field shown in the form; one that inherits keeps
+      // inheriting. Only Spoolman spools report the flag (#2908).
+      setCoreWeightTouched(isCopying && spool?.core_weight_is_inherited === false);
       setLocationIdTouched(false);
+      setSupplierLinksTouched(false);
+      setPrinterProfilesTouched(false);
+      setPrefilledFromDefault(false);
+      kFromDefault.current = new Map();
+      presetsFromDefault.current = new Map();
+      userKKeys.current = new Set();
+      userPresetKeys.current = new Set();
+      presetFromDefault.current = false;
+      setSaveAsDefault(false);
+      setDefaultScope('all');
     }
   }, [isOpen, spool, mode, isCopying]);
 
@@ -501,6 +577,94 @@ export function SpoolFormModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, spool?.id, spoolmanMode]);
 
+  // A new spool starts from its product's profile default (#1326): fill the
+  // Printers tab, and an empty preset field, with what the create will apply,
+  // so the user sees it and can change it before saving. Only for a fresh
+  // create -- an edit shows the spool's own profiles and a copy the copied
+  // ones. What the user set wins: the default only fills hotends and models
+  // left empty, so a touched tab still shows (and saves) the rest of it.
+  // Follows the product as it is typed: what one product's default put in and
+  // the user left alone gives way to the next product's.
+  const isCreating = !isEditing && !isCopying;
+  useEffect(() => {
+    if (!isOpen || !isCreating) return;
+    const material = formData.material.trim();
+    let cancelled = false;
+    const apply = (resolved: ResolvedProfileDefault | null) => {
+      if (cancelled) return;
+      const kRows = selectionFromKProfiles(resolved?.k_profiles ?? []);
+      // Read before the updaters, which React may run twice.
+      const previousK = kFromDefault.current;
+      const previousPresets = presetsFromDefault.current;
+      setSelectedProfiles(prev => {
+        const next = new Map(prev);
+        for (const [key, value] of previousK) if (next.get(key) === value) next.delete(key);
+        const filled = new Map<string, CalibrationProfile>();
+        for (const [key, value] of kRows) {
+          if (next.has(key) || userKKeys.current.has(key)) continue;
+          next.set(key, value);
+          filled.set(key, value);
+        }
+        kFromDefault.current = filled;
+        return next;
+      });
+      const presetRows = new Map<string, PresetChoice>();
+      for (const row of resolved?.presets ?? []) {
+        presetRows.set(presetKey(row.printer_model, row.nozzle_diameter || ''), {
+          code: row.slicer_filament || '',
+          name: row.slicer_filament_name || '',
+        });
+      }
+      setModelPresets(prev => {
+        const next = new Map(prev);
+        for (const [key, value] of previousPresets) if (next.get(key) === value) next.delete(key);
+        const filled = new Map<string, PresetChoice>();
+        for (const [key, value] of presetRows) {
+          if (next.has(key) || userPresetKeys.current.has(key)) continue;
+          next.set(key, value);
+          filled.set(key, value);
+        }
+        presetsFromDefault.current = filled;
+        return next;
+      });
+      setPrefilledFromDefault(kRows.size > 0 || presetRows.size > 0 || !!resolved?.slicer_filament);
+      // The current preset, not the one of the render that asked.
+      if (resolved?.slicer_filament && (!formDataRef.current.slicer_filament || presetFromDefault.current)) {
+        setFormData(prev => ({ ...prev, slicer_filament: resolved.slicer_filament || '' }));
+        setPresetInputValue(resolved.slicer_filament_name || resolved.slicer_filament);
+        presetFromDefault.current = true;
+      } else if (presetFromDefault.current) {
+        // The previous product's preset; this one's default has none.
+        setFormData(prev => ({ ...prev, slicer_filament: '' }));
+        setPresetInputValue('');
+        presetFromDefault.current = false;
+      }
+    };
+    if (!material) {
+      apply(null);
+      return;
+    }
+    // Typed field by field: ask once the typing stops.
+    const timer = setTimeout(() => {
+      api
+        .resolveProfileDefault({
+          brand: formData.brand.trim(),
+          material,
+          subtype: formData.subtype.trim(),
+          color_name: formData.color_name.trim(),
+        })
+        .then(apply)
+        .catch(e => {
+          // Non-fatal: the create still applies the default on the server.
+          if (!cancelled) console.error('Failed to look up the profile default:', e);
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [isOpen, isCreating, formData.brand, formData.material, formData.subtype, formData.color_name]);
+
   // Legacy rows may have storage_location text but no location_id yet — link when catalog loads.
   useEffect(() => {
     if (!isOpen || !spool || locationIdTouched || formData.location_id != null) return;
@@ -527,7 +691,11 @@ export function SpoolFormModal({
         : {}),
     }));
     if (key === 'weight_used') setWeightTouched(true);
+    if (key === 'core_weight') setCoreWeightTouched(true);
     if (key === 'location_id') setLocationIdTouched(true);
+    if (key === 'last_dried_at') setLastDriedTouched(true);
+    // A preset the user picked is theirs: the next product's default leaves it alone.
+    if (key === 'slicer_filament') presetFromDefault.current = false;
     if (errors[key]) {
       setErrors(prev => ({ ...prev, [key]: undefined }));
     }
@@ -573,7 +741,10 @@ export function SpoolFormModal({
       if (newSpool?.id) {
         const ok = await savePrinterProfiles(newSpool.id);
         if (!ok) return;
+        const suppliersOk = await saveSupplierLinks(newSpool.id);
+        if (!suppliersOk) return;
       }
+      await saveProfileDefault();
       await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated([newSpool]);
       showToast(t('inventory.spoolCreated'), 'success');
@@ -608,14 +779,20 @@ export function SpoolFormModal({
         ? spoolmanResult.created
         : (result as InventorySpool[]);
 
-      // Bulk create: every copy gets the same profiles and overrides. Skipped
-      // entirely when the user configured neither, so a plain bulk add does
-      // not fire two writes per spool.
-      if (selectedProfiles.size > 0 || modelPresets.size > 0) {
+      // Bulk create: every copy gets the same profiles and overrides. A no-op
+      // when the user left the Printers tab alone (savePrinterProfiles), so a
+      // plain bulk add neither fires two writes per spool nor clears the
+      // profile default the backend gave every copy (#1326).
+      for (const s of createdSpools) {
+        await savePrinterProfiles(s.id);
+      }
+      // Every copy of a bulk add shares the same supplier assignments (#2988).
+      if (shouldSaveSupplierLinks) {
         for (const s of createdSpools) {
-          await savePrinterProfiles(s.id);
+          await saveSupplierLinks(s.id);
         }
       }
+      await saveProfileDefault();
       await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated(createdSpools);
       if (spoolmanResult && spoolmanResult.failed_count > 0) {
@@ -649,7 +826,10 @@ export function SpoolFormModal({
       if (spool?.id) {
         const ok = await savePrinterProfiles(spool.id);
         if (!ok) return;
+        const suppliersOk = await saveSupplierLinks(spool.id);
+        if (!suppliersOk) return;
       }
+      await saveProfileDefault();
       await refreshSpoolQueries();
       showToast(t('inventory.spoolUpdated'), 'success');
       onClose();
@@ -688,13 +868,13 @@ export function SpoolFormModal({
   // the slot assignment lives in the spoolman_slot_assignments table keyed by
   // spoolman_spool_id, not in the legacy spool_assignments table — #1336 was the
   // resulting "Unassign button is always disabled" report.
-  const { data: assignments } = useQuery({
+  const { data: assignments, isLoading: assignmentsLoading } = useQuery({
     queryKey: ['spool-assignments'],
     queryFn: () => api.getAssignments(),
     enabled: isOpen && isEditing && !spoolmanMode,
   });
-  const { data: spoolmanSlotAssignments } = useQuery({
-    queryKey: ['spoolman-slot-assignments-all'],
+  const { data: spoolmanSlotAssignments, isLoading: spoolmanAssignmentsLoading } = useQuery({
+    queryKey: ['spoolman-slot-assignments', 'all'],
     queryFn: () => api.getSpoolmanSlotAssignments(),
     enabled: isOpen && isEditing && spoolmanMode,
   });
@@ -705,6 +885,7 @@ export function SpoolFormModal({
     }
     return assignments?.find(a => a.spool_id === spool.id);
   })();
+  const assignmentLoading = spoolmanMode ? spoolmanAssignmentsLoading : assignmentsLoading;
 
   // Read inventory + settings caches (already populated by InventoryPage) to
   // drive the category autocomplete and low-stock-threshold placeholder. #729
@@ -713,11 +894,7 @@ export function SpoolFormModal({
     queryFn: () => api.getSpools(true),
     enabled: isOpen,
   });
-  const { data: settingsForForm } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-    enabled: isOpen,
-  });
+  const { data: settingsForForm } = useUiSettings({ enabled: isOpen });
 
   // Backend Bambu printer-model registry, so the Printers tab can read the
   // model out of a preset name and offer each model only its own presets. The
@@ -738,6 +915,16 @@ export function SpoolFormModal({
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   })();
+  // Autocomplete for the internal material number (#2870), mirroring the
+  // category datalist above.
+  const availableMaterialNumbers = (() => {
+    const set = new Set<string>();
+    for (const s of allSpools ?? []) {
+      const n = s.material_number?.trim();
+      if (n) set.add(n);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  })();
   const globalLowStockThreshold = settingsForForm?.low_stock_threshold ?? 20;
 
   const unassignMutation = useMutation({
@@ -752,7 +939,7 @@ export function SpoolFormModal({
     },
     onSuccess: async () => {
       if (spoolmanMode) {
-        await queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments-all'] });
+        await queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments', 'all'] });
         await queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments'] });
       } else {
         await queryClient.invalidateQueries({ queryKey: ['spool-assignments'] });
@@ -765,13 +952,49 @@ export function SpoolFormModal({
     },
   });
 
+  // Supplier assignments (#2988): replace-all save.
+  //
+  // Skipped on an untouched create so the backend's inheritance can fill the
+  // new spool in — an empty list would wipe what it just attached. A COPY is
+  // the opposite case and always saves: the dialog seeded the chips from the
+  // spool being copied and showed them, so they have to be what the copy
+  // gets. Inheritance cannot stand in for that — it keys on the (material,
+  // subtype, brand, color_name) tuple and so resolves to the NEWEST spool of
+  // the product rather than the one on screen, and in Spoolman mode there is
+  // no inheritance at all.
+  const shouldSaveSupplierLinks = supplierLinksTouched || isCopying;
+
+  const saveSupplierLinks = async (spoolId: number): Promise<boolean> => {
+    if (!shouldSaveSupplierLinks) return true;
+    // Spoolman parity (#2988): the assignment rows live Bambuddy-side either
+    // way; only the endpoint differs (twin table keyed by the remote id).
+    const save = spoolmanMode ? api.setSpoolmanSpoolSuppliers : api.setSpoolSuppliers;
+    try {
+      await save(
+        spoolId,
+        supplierLinks.map((link) => ({
+          supplier_id: link.supplier_id,
+          supplier_article_number: link.supplier_article_number.trim() || null,
+          quoted_price_per_kg: link.quoted_price_per_kg,
+          is_purchase_source: link.is_purchase_source,
+        })),
+      );
+      return true;
+    } catch (err) {
+      console.error('SpoolFormModal.saveSupplierLinks failed:', err);
+      showToast(t('inventory.suppliers.saveFailed'), 'error');
+      return false;
+    }
+  };
+
   // Save everything the Printers tab holds: one K profile per hotend and the
   // per-printer-model preset overrides. Returns false if either write failed,
   // which keeps the modal open so the user does not lose what they picked.
-  const savePrinterProfiles = async (spoolId: number): Promise<boolean> => {
-    const saveKApi = spoolmanMode ? api.saveSpoolmanKProfiles : api.saveSpoolKProfiles;
-    const savePresetApi = spoolmanMode ? api.saveSpoolmanFilamentPresets : api.saveSpoolFilamentPresets;
+  // On a create, only once the user changed something there: an untouched
+  // tab holds nothing, or the profile default the backend applies itself.
+  const shouldSavePrinterProfiles = isEditing || isCopying || printerProfilesTouched;
 
+  const buildPrinterProfiles = (): { profiles: SpoolKProfileInput[]; presets: SpoolFilamentPresetInput[] } => {
     // The selection Map is keyed by hotend and holds the calibration itself,
     // so nothing has to be resolved back out of the printer's live list. That
     // also fixes a real defect in the old key-based lookup: it matched a
@@ -809,6 +1032,15 @@ export function SpoolFormModal({
       });
     }
 
+    return { profiles, presets };
+  };
+
+  const savePrinterProfiles = async (spoolId: number): Promise<boolean> => {
+    if (!shouldSavePrinterProfiles) return true;
+    const saveKApi = spoolmanMode ? api.saveSpoolmanKProfiles : api.saveSpoolKProfiles;
+    const savePresetApi = spoolmanMode ? api.saveSpoolmanFilamentPresets : api.saveSpoolFilamentPresets;
+    const { profiles, presets } = buildPrinterProfiles();
+
     // Both are full replacements, so both run even when empty -- that is how
     // the user clears the last profile or the last override.
     try {
@@ -830,15 +1062,51 @@ export function SpoolFormModal({
     return true;
   };
 
+  const profileDefaultProduct = [formData.brand, formData.material, formData.subtype]
+    .map(part => part.trim())
+    .filter(Boolean)
+    .join(' ');
+
+  // "Save as default" on the Printers tab (#1326): the tab and the spool's own
+  // preset become what new spools of this product start with. After the
+  // spool is saved, so a refused spool save leaves the default alone; a failed
+  // default save only warns -- the spool is saved either way.
+  const saveProfileDefault = async (): Promise<void> => {
+    if (!saveAsDefault || !formData.material.trim()) return;
+    const { profiles, presets } = buildPrinterProfiles();
+    const slicerFilament = formData.slicer_filament || null;
+    try {
+      await api.saveProfileDefault({
+        brand: formData.brand.trim(),
+        material: formData.material.trim(),
+        subtype: formData.subtype.trim(),
+        // "Only <colour>" needs a colour; without one the tick box shows, and
+        // this saves, the default for all colours.
+        color_name: defaultScope === 'colour' ? formData.color_name.trim() : '',
+        slicer_filament: slicerFilament,
+        slicer_filament_name: slicerFilament ? selectedPresetOption?.displayName || presetInputValue || null : null,
+        presets,
+        k_profiles: profiles,
+      });
+      await queryClient.invalidateQueries({ queryKey: ['profile-defaults'] });
+    } catch (e) {
+      console.error('Failed to save the profile default:', e);
+      showToast(t('inventory.profileDefaults.saveFailed'), 'warning');
+    }
+  };
+
   // Close on Escape key
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      // The nested AMS assignment dialog owns Escape while it is open. Both
+      // listeners live on document, so propagation control in the child would
+      // not prevent this editor handler from running for the same key press.
+      if (e.key === 'Escape' && !showAssignModal) onClose();
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, showAssignModal]);
 
   if (!isOpen) return null;
 
@@ -864,7 +1132,16 @@ export function SpoolFormModal({
       extra_colors: formData.extra_colors || null,
       effect_type: formData.effect_type || null,
       label_weight: formData.label_weight,
-      ...(spoolmanMode ? {} : { core_weight: formData.core_weight, core_weight_catalog_id: formData.core_weight_catalog_id }),
+      // In Spoolman mode the picker opens on the tare the spool resolves to,
+      // which is the filament type's unless the spool has its own. Sending it
+      // untouched would copy that inherited value onto the spool and stop it
+      // following the filament, so only a value the user set goes out (#2908).
+      // The catalogue id has no field on the Spoolman side.
+      ...(spoolmanMode
+        ? coreWeightTouched
+          ? { core_weight: formData.core_weight }
+          : {}
+        : { core_weight: formData.core_weight, core_weight_catalog_id: formData.core_weight_catalog_id }),
       slicer_filament: formData.slicer_filament || null,
       slicer_filament_name: presetName,
       nozzle_temp_min: null,
@@ -873,6 +1150,7 @@ export function SpoolFormModal({
       cost_per_kg: formData.cost_per_kg,
       category: formData.category.trim() || null,
       low_stock_threshold_pct: formData.low_stock_threshold_pct,
+      material_number: formData.material_number.trim() || null,
       ...(spoolmanMode ? { spoolman_filament_id: formData.spoolman_filament_id } : {}),
     };
 
@@ -888,6 +1166,10 @@ export function SpoolFormModal({
       data.location_id = formData.location_id;
     }
 
+    if (isEditing && lastDriedTouched) {
+      data.last_dried_at = formData.last_dried_at ? new Date(formData.last_dried_at).toISOString() : null;
+    }
+
     if (isEditing) {
       updateMutation.mutate(data);
     } else if (quantity > 1) {
@@ -900,6 +1182,7 @@ export function SpoolFormModal({
   const isPending = createMutation.isPending || bulkCreateMutation.isPending || updateMutation.isPending || deleteTagMutation.isPending || unassignMutation.isPending;
 
   return (
+    <>
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
@@ -1078,7 +1361,9 @@ export function SpoolFormModal({
                   spoolCatalog={spoolCatalog}
                   currencySymbol={currencySymbol}
                   availableCategories={availableCategories}
+                  availableMaterialNumbers={availableMaterialNumbers}
                   availableLocations={storageLocations}
+                  showLastDried={isEditing}
                   onCreateLocation={async (name) => {
                     try {
                       const created = await api.createLocation({ name });
@@ -1100,10 +1385,25 @@ export function SpoolFormModal({
                 />
               </div>
 
-              {/* Usage History (only when editing internal inventory; Spoolman tracks its own) */}
-              {isEditing && spool && !spoolmanMode && (
+              {/* Suppliers (#2988) — both inventories: the assignments live
+                  Bambuddy-side either way (Spoolman's vendor is the
+                  manufacturer, not the seller), so the same section renders
+                  in Spoolman mode and saves to the twin endpoint. */}
+              <div>
+                <SupplierSection
+                  links={supplierLinks}
+                  onChange={(next) => {
+                    setSupplierLinks(next);
+                    setSupplierLinksTouched(true);
+                  }}
+                  currencySymbol={currencySymbol}
+                />
+              </div>
+
+              {/* Usage History: in Spoolman mode, the prints Bambuddy charged to the spool (#3407) */}
+              {isEditing && spool && (
                 <div>
-                  <SpoolUsageHistory spoolId={spool.id} />
+                  <SpoolUsageHistory spoolId={spool.id} spoolman={spoolmanMode} createdAt={spool.created_at} />
                 </div>
               )}
             </div>
@@ -1113,13 +1413,25 @@ export function SpoolFormModal({
               printersWithCalibrations={resolvedCalibrations}
               filamentOptions={filamentOptions}
               modelPresets={modelPresets}
-              setModelPresets={setModelPresets}
+              setModelPresets={editModelPresets}
               selectedProfiles={selectedProfiles}
-              setSelectedProfiles={setSelectedProfiles}
+              setSelectedProfiles={editSelectedProfiles}
               selectedGroupId={selectedGroupId}
               setSelectedGroupId={setSelectedGroupId}
               printerModels={printerModelsData}
               isLoading={loadingCalibrations}
+            />
+          )}
+          {activeTab === 'printers' && (
+            <ProfileDefaultOption
+              product={profileDefaultProduct}
+              colorName={formData.color_name}
+              prefilled={prefilledFromDefault}
+              checked={saveAsDefault}
+              onCheckedChange={setSaveAsDefault}
+              scope={defaultScope}
+              onScopeChange={setDefaultScope}
+              disabled={!formData.material.trim()}
             />
           )}
         </div>
@@ -1143,14 +1455,25 @@ export function SpoolFormModal({
                 <Tag className="w-4 h-4" />
                 {t('inventory.clearRfid', 'Clear RFID Tag')}
               </Button>
-              <Button
-                variant="secondary"
-                onClick={() => unassignMutation.mutate()}
-                disabled={isPending || !spoolAssignment}
-              >
-                <Unlink className="w-4 h-4" />
-                {t('inventory.unassignSpool', 'Unassign')}
-              </Button>
+              {spoolAssignment ? (
+                <Button
+                  variant="secondary"
+                  onClick={() => unassignMutation.mutate()}
+                  disabled={isPending || assignmentLoading}
+                >
+                  <Unlink className="w-4 h-4" />
+                  {t('inventory.unassignSpool', 'Unassign')}
+                </Button>
+              ) : (
+                <Button
+                  variant="secondary"
+                  onClick={() => setShowAssignModal(true)}
+                  disabled={isPending || assignmentLoading}
+                >
+                  <Link2 className="w-4 h-4" />
+                  {t('inventory.assignSpool', 'Assign Spool')}
+                </Button>
+              )}
             </div>
           )}
           <div className="flex gap-2 ml-auto">
@@ -1177,5 +1500,16 @@ export function SpoolFormModal({
         </div>
       </div>
     </div>
+    {isEditing && spool && (
+      <AssignToAmsModal
+        isOpen={showAssignModal}
+        onClose={() => setShowAssignModal(false)}
+        spool={spool}
+        printerId={null}
+        variant="dialog"
+        spoolmanMode={spoolmanMode}
+      />
+    )}
+    </>
   );
 }

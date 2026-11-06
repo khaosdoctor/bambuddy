@@ -6,8 +6,10 @@ import { Layers, Settings2, Package, Unlink, Link2, X } from 'lucide-react';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { api } from '../../api/client';
 import type { PrinterStatus, AMSTray, SpoolAssignment } from '../../api/client';
-import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool, resolveSlotNozzleDiameter } from '../../utils/amsHelpers';
+import { getGlobalTrayId, getEmptySlotKind, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool, resolveSlotNozzleDiameter, slotPresetDescribesTray } from '../../utils/amsHelpers';
 import { getSwatchStyle, resolveSpoolColorName } from '../../utils/colors';
+import { mapModelCode } from '../../utils/printerModel';
+import { spoolSwatchStyle } from '../../components/spoolbuddy/spoolPaint';
 
 /**
  * " - Candy Red", or nothing when the colour has no name we can show.
@@ -31,26 +33,12 @@ import { ConfigureAmsSlotModal } from '../../components/ConfigureAmsSlotModal';
 import { AssignSpoolModal } from '../../components/AssignSpoolModal';
 import { LinkSpoolModal } from '../../components/LinkSpoolModal';
 import { useToast } from '../../contexts/ToastContext';
+import { useUiSettings } from '../../hooks/useUiSettings';
 
 function getAmsName(amsId: number): string {
   if (amsId <= 3) return `AMS ${String.fromCharCode(65 + amsId)}`;
   if (amsId >= 128 && amsId <= 135) return `AMS HT ${String.fromCharCode(65 + amsId - 128)}`;
   return `AMS ${amsId}`;
-}
-
-function mapModelCode(ssdpModel: string | null): string {
-  if (!ssdpModel) return '';
-  const modelMap: Record<string, string> = {
-    'O1D': 'H2D', 'O1E': 'H2D Pro', 'O2D': 'H2D Pro', 'O1C': 'H2C', 'O1C2': 'H2C', 'O1S': 'H2S',
-    'BL-P001': 'X1C', 'BL-P002': 'X1', 'BL-P003': 'X1E',
-    'N6': 'X2D',
-    'N9': 'A2L',
-    'C11': 'P1S', 'C12': 'P1P', 'C13': 'P2S',
-    'N2S': 'A1', 'N1': 'A1 Mini',
-    'X1C': 'X1C', 'X1': 'X1', 'X1E': 'X1E', 'X2D': 'X2D', 'P1S': 'P1S', 'P1P': 'P1P', 'P2S': 'P2S',
-    'A1': 'A1', 'A1 Mini': 'A1 Mini', 'A2L': 'A2L', 'H2D': 'H2D', 'H2D Pro': 'H2D Pro', 'H2C': 'H2C', 'H2S': 'H2S',
-  };
-  return modelMap[ssdpModel] || ssdpModel;
 }
 
 function isTrayEmpty(tray: AMSTray): boolean {
@@ -89,11 +77,7 @@ export function SpoolBuddyAmsPage() {
     staleTime: 2 * 60 * 1000,
   });
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: () => api.getSettings(),
-    staleTime: 5 * 60 * 1000,
-  });
+  const { data: settings } = useUiSettings({ staleTime: 5 * 60 * 1000 });
 
   // Fetch Spoolman status to enable fill-level chain
   const { data: spoolmanStatus } = useQuery({
@@ -118,7 +102,7 @@ export function SpoolBuddyAmsPage() {
   // Without these, AmsUnitCard shows an empty fill bar and the Link button
   // stays active even though the slot is occupied.
   const { data: spoolmanSlotAssignmentsAll = [] } = useQuery({
-    queryKey: ['spoolman-slot-assignments-all'],
+    queryKey: ['spoolman-slot-assignments', 'all'],
     queryFn: () => api.getSpoolmanSlotAssignments(),
     enabled: !!spoolmanEnabled,
     staleTime: 30 * 1000,
@@ -139,9 +123,11 @@ export function SpoolBuddyAmsPage() {
 
   // Build fill-level override map from inventory assignments
   // Key: "amsId-trayId", Value: fill percentage (0-100)
+  // Built-in rows only in built-in mode: kept through a switch to Spoolman
+  // (#2812), they would give a slot a fill from the other inventory (#3430).
   const fillOverrides = useMemo(() => {
     const map: Record<string, number> = {};
-    if (!assignments) return map;
+    if (!assignments || spoolmanStatus?.enabled) return map;
     for (const a of assignments) {
       const sp = a.spool;
       if (sp && sp.label_weight > 0 && sp.weight_used != null) {
@@ -150,7 +136,7 @@ export function SpoolBuddyAmsPage() {
       }
     }
     return map;
-  }, [assignments]);
+  }, [assignments, spoolmanStatus?.enabled]);
 
   // Look up Spoolman fill level for a given tray
   const printerSerial = printer?.serial_number ?? '';
@@ -260,7 +246,6 @@ export function SpoolBuddyAmsPage() {
   const [configureSlotModal, setConfigureSlotModal] = useState<{
     amsId: number;
     trayId: number;
-    trayCount: number;
     trayType?: string;
     trayColor?: string;
     traySubBrands?: string;
@@ -274,7 +259,6 @@ export function SpoolBuddyAmsPage() {
   const [slotActionPicker, setSlotActionPicker] = useState<{
     amsId: number;
     trayId: number;
-    trayCount: number;
     tray: AMSTray | null;
     trayType?: string;
     trayColor?: string;
@@ -291,7 +275,7 @@ export function SpoolBuddyAmsPage() {
     printerId: number;
     amsId: number;
     trayId: number;
-    trayInfo: { type: string; material?: string; profile?: string; color: string; location: string };
+    trayInfo: { type: string; material?: string; profile?: string; color: string; location: string; emptyKind?: 'physical' | 'reset' | null };
   } | null>(null);
 
   // Link spool modal state (Spoolman)
@@ -342,7 +326,7 @@ export function SpoolBuddyAmsPage() {
       // these PrintersPage / InventoryPage / SpoolBuddyDashboard keep showing
       // the spool as still assigned for ~30s until refetchInterval kicks in.
       queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments'] });
-      queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments-all'] });
+      queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments', 'all'] });
       queryClient.invalidateQueries({ queryKey: ['spoolman-inventory-spools'] });
       setSlotActionPicker(null);
     },
@@ -365,7 +349,7 @@ export function SpoolBuddyAmsPage() {
       // unlinkSpoolMutation does the same set — keep them aligned so both
       // unbind paths refresh the same caches.
       queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments'] });
-      queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments-all'] });
+      queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments', 'all'] });
       queryClient.invalidateQueries({ queryKey: ['spoolman-inventory-spools'] });
       queryClient.invalidateQueries({ queryKey: ['unlinked-spools'] });
       queryClient.invalidateQueries({ queryKey: ['linked-spools'] });
@@ -398,7 +382,6 @@ export function SpoolBuddyAmsPage() {
     const slotData = {
       amsId,
       trayId,
-      trayCount: tray ? (amsId >= 128 ? 1 : 4) : 4,
       tray,
       trayType: tray?.tray_type || undefined,
       trayColor: tray?.tray_color || undefined,
@@ -406,7 +389,10 @@ export function SpoolBuddyAmsPage() {
       trayInfoIdx: tray?.tray_info_idx || undefined,
       extruderId: isDualNozzle ? extruderId : undefined,
       caliIdx: tray?.cali_idx,
-      savedPresetId: slotPreset?.preset_id,
+      // Only while it still describes the slot (#3216).
+      savedPresetId: slotPresetDescribesTray(slotPreset?.preset_id, tray?.tray_info_idx, slotPreset?.tray_info_idx)
+        ? slotPreset?.preset_id
+        : undefined,
       location: `${getAmsName(amsId)} Slot ${trayId + 1}`,
     };
 
@@ -420,7 +406,6 @@ export function SpoolBuddyAmsPage() {
     const slotData = {
       amsId: 255,
       trayId: slotTrayId,
-      trayCount: 1,
       tray: isTrayEmpty(extTray) ? null : extTray,
       trayType: extTray.tray_type || undefined,
       trayColor: extTray.tray_color || undefined,
@@ -428,7 +413,9 @@ export function SpoolBuddyAmsPage() {
       trayInfoIdx: extTray.tray_info_idx || undefined,
       extruderId: isDualNozzle ? (extTrayId === 254 ? 1 : 0) : undefined,
       caliIdx: extTray.cali_idx,
-      savedPresetId: extSlotPreset?.preset_id,
+      savedPresetId: slotPresetDescribesTray(extSlotPreset?.preset_id, extTray.tray_info_idx, extSlotPreset?.tray_info_idx)
+        ? extSlotPreset?.preset_id
+        : undefined,
       location: isDualNozzle
         ? (extTrayId === 254 ? 'Ext-L' : 'Ext-R')
         : 'External',
@@ -447,7 +434,7 @@ export function SpoolBuddyAmsPage() {
 
   const openAssignFromPicker = useCallback(() => {
     if (!slotActionPicker || !selectedPrinterId) return;
-    const { amsId, trayId, trayType, trayColor, location } = slotActionPicker;
+    const { amsId, trayId, tray, trayType, trayColor, location } = slotActionPicker;
     setSlotActionPicker(null);
     setAssignSpoolModal({
       printerId: selectedPrinterId,
@@ -458,6 +445,7 @@ export function SpoolBuddyAmsPage() {
         material: trayType,
         color: trayColor?.slice(0, 6) || '',
         location,
+        emptyKind: getEmptySlotKind(tray),
       },
     });
   }, [slotActionPicker, selectedPrinterId]);
@@ -705,6 +693,7 @@ export function SpoolBuddyAmsPage() {
           slotInfo={configureSlotModal}
           printerModel={mapModelCode(printer?.model ?? null) || undefined}
           nozzleDiameter={resolveSlotNozzleDiameter(status, configureSlotModal.amsId)}
+          printerState={status?.state}
           fullScreen
           onSuccess={() => {
             queryClient.invalidateQueries({ queryKey: ['slotPresets', selectedPrinterId] });
@@ -768,7 +757,7 @@ export function SpoolBuddyAmsPage() {
                       {assignment.spool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={getSwatchStyle(assignment.spool.rgba)}
+                          style={spoolSwatchStyle(assignment.spool) ?? getSwatchStyle(assignment.spool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">
@@ -802,7 +791,7 @@ export function SpoolBuddyAmsPage() {
                       {spoolmanAssignedSpool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={getSwatchStyle(spoolmanAssignedSpool.rgba)}
+                          style={spoolSwatchStyle(spoolmanAssignedSpool) ?? getSwatchStyle(spoolmanAssignedSpool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">

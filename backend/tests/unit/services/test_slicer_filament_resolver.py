@@ -357,7 +357,9 @@ class TestACustomPresetsOwnFilamentId:
                 slicer_filament_name=None,
                 material="PLA",
             )
-        assert idx == "GFNLS03"
+        # SUNLU PLA+'s own id: its setting_id does not follow the "drop the S"
+        # rule, which gave "GFNLS03", an id no profile has (#3387).
+        assert idx == "GFSNL03"
         assert sid == "PFUSfb87cd50b76616"
 
 
@@ -407,6 +409,26 @@ class TestOrcaCloudIsTheFirstSource:
         assert brand == "Overture Matte PLA"
         assert type_override == "PLA"
         svc.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_ini_quoted_filament_type_is_read_like_the_slicer(self):
+        """#3380: Orca Cloud can return ``filament_type`` INI-quoted."""
+        db = MagicMock()
+        svc = self._svc(
+            {"id": self.ORCA_ID, "name": "My PETG", "content": {"filament_id": "P56e1be0", "filament_type": '"PETG"'}}
+        )
+        with patch(
+            "backend.app.api.routes.orca_cloud._build_authenticated_service",
+            AsyncMock(return_value=svc),
+        ):
+            _idx, _sid, _brand, type_override = await resolve_slicer_filament(
+                db=db,
+                current_user=None,
+                slicer_filament=self.ORCA_ID,
+                slicer_filament_name=None,
+                material="PETG",
+            )
+        assert type_override == "PETG"
 
     @pytest.mark.asyncio
     async def test_a_profile_with_no_filament_id_leaves_the_caller_its_fallback(self):
@@ -483,3 +505,96 @@ class TestOrcaCloudIsTheFirstSource:
             )
         assert idx == ""
         assert sid == ""
+
+
+class TestOrcaLookupFollowsParents:
+    """``lookup_orca_filament_id`` (#3216).
+
+    A profile that inherits carries only its overrides, so its filament id lives
+    on a parent: another of the user's Orca profiles, or a system preset. The
+    parent's id is what OrcaSlicer resolves the slot to, which beats a generic.
+    """
+
+    ORCA_ID = "34d8f588-860b-5be1-bcbe-c0d46d96324b"
+
+    @staticmethod
+    def _svc(profile, others=()):
+        svc = MagicMock()
+        svc.get_profile = AsyncMock(return_value=profile)
+        svc.list_profiles = AsyncMock(return_value=[profile, *others])
+        svc.close = AsyncMock()
+        return svc
+
+    async def _lookup(self, svc):
+        from backend.app.services.slicer_filament_resolver import lookup_orca_filament_id
+
+        with patch(
+            "backend.app.api.routes.orca_cloud._build_authenticated_service",
+            AsyncMock(return_value=svc),
+        ):
+            return await lookup_orca_filament_id(MagicMock(), None, self.ORCA_ID)
+
+    @pytest.mark.asyncio
+    async def test_own_id_needs_no_second_pull(self):
+        svc = self._svc({"id": self.ORCA_ID, "name": "Mine", "content": {"filament_id": "Pfc74047", "inherits": ""}})
+        found = await self._lookup(svc)
+        assert (found.filament_id, found.source, found.reason) == ("Pfc74047", "own", "")
+        svc.list_profiles.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inherited_from_a_user_profile(self):
+        child = {"id": self.ORCA_ID, "name": "Mine v2", "content": {"inherits": "Mine v1", "filament_type": ["PLA"]}}
+        parent = {"id": "p", "name": "Mine v1", "content": {"name": "Mine v1", "filament_id": "Pad3f856"}}
+        found = await self._lookup(self._svc(child, [parent]))
+        assert (found.filament_id, found.source) == ("Pad3f856", "inherited")
+        assert found.filament_type == "PLA"
+
+    @pytest.mark.asyncio
+    async def test_through_two_user_profiles_to_a_bambu_system_preset(self):
+        child = {"id": self.ORCA_ID, "name": "C", "content": {"inherits": "B"}}
+        middle = {"id": "b", "name": "B", "content": {"inherits": "Bambu PLA Basic @BBL H2D"}}
+        found = await self._lookup(self._svc(child, [middle]))
+        # The catalog id OrcaSlicer translates at the printer boundary.
+        assert (found.filament_id, found.source) == ("GFA00", "inherited")
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_system_parent_leaves_the_fallback(self):
+        child = {"id": self.ORCA_ID, "name": "C", "content": {"inherits": "Someone PLA @Somewhere"}}
+        found = await self._lookup(self._svc(child))
+        assert (found.filament_id, found.reason) == ("", "no_filament_id")
+
+    @pytest.mark.asyncio
+    async def test_an_inherits_cycle_terminates(self):
+        a = {"id": self.ORCA_ID, "name": "A", "content": {"inherits": "B"}}
+        b = {"id": "b", "name": "B", "content": {"inherits": "A"}}
+        found = await self._lookup(self._svc(a, [b]))
+        assert (found.filament_id, found.reason) == ("", "no_filament_id")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_says_so(self):
+        svc = MagicMock()
+        svc.get_profile = AsyncMock(side_effect=RuntimeError("network down"))
+        svc.close = AsyncMock()
+        found = await self._lookup(svc)
+        assert (found.filament_id, found.reason) == ("", "lookup_failed")
+        svc.close.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_caller_without_orca_access_is_told_so(self):
+        from backend.app.services.slicer_filament_resolver import lookup_orca_filament_id
+
+        user = MagicMock()
+        user.has_permission.return_value = False
+        found = await lookup_orca_filament_id(MagicMock(), user, self.ORCA_ID)
+        assert found.reason == "no_permission"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_parent_pull_keeps_name_and_type(self):
+        """The spool resolver uses them for the slot's brand and type, as it did
+        before the lookup followed parents."""
+        child = {"id": self.ORCA_ID, "name": "Mine v2", "content": {"inherits": "Mine v1", "filament_type": ["PETG"]}}
+        svc = self._svc(child)
+        svc.list_profiles = AsyncMock(side_effect=RuntimeError("timeout"))
+        found = await self._lookup(svc)
+        assert (found.filament_id, found.reason) == ("", "lookup_failed")
+        assert (found.name, found.filament_type) == ("Mine v2", "PETG")

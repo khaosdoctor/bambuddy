@@ -22,6 +22,24 @@ import pytest
 from backend.app.services.spoolman import AMSTray, SpoolmanClient
 
 
+class _NoCatalog:
+    """A DB session whose colour catalogue has no row for anything.
+
+    ``_find_or_create_filament`` resolves the expected colour name from the
+    catalogue now (#2907), so it needs a session. These tests predate the
+    catalogue and were written against the state where it cannot name the
+    colour, which is this. Tests that care about the name pass a real session.
+    """
+
+    async def execute(self, *_args, **_kwargs):
+        class _Result:
+            @staticmethod
+            def scalar_one_or_none():
+                return None
+
+        return _Result()
+
+
 class FakeSpoolman:
     """A Spoolman that rejects unregistered extra keys, the way the real one does."""
 
@@ -48,6 +66,10 @@ class FakeSpoolman:
         path = request.url.path.removeprefix("/api/v1")
         self.log.append(f"{request.method} {path}")
         body = json.loads(request.content) if request.content else {}
+
+        # A Spoolman before 0.27, which has no tag endpoints.
+        if path.startswith("/tag/"):
+            return httpx.Response(404, json={"detail": "Not Found"})
 
         if path == "/field/spool" and request.method == "GET":
             if self.field_status != 200:
@@ -141,7 +163,7 @@ class TestTheReportedCase:
         fake = FakeSpoolman()  # GET /field/spool returns nothing: no custom fields at all
         client = _client(fake)
 
-        result = await client.sync_ams_tray(_tray("D144798DEF394926ACAE9D69ABA910CC"), "OJIMPO-X2D-01")
+        result = await client.sync_ams_tray(_tray("D144798DEF394926ACAE9D69ABA910CC"), "OJIMPO-X2D-01", _NoCatalog())
 
         assert result is not None, "spool creation was rejected -- this is the reported 400"
         assert result["extra"]["tag"] == json.dumps("D144798DEF394926ACAE9D69ABA910CC")
@@ -158,7 +180,7 @@ class TestTheReportedCase:
             "1D1F3C49046246DBBADBC3631B7F1B61",
         ]
 
-        synced = [await client.sync_ams_tray(_tray(tag), "OJIMPO-X2D-01") for tag in tags]
+        synced = [await client.sync_ams_tray(_tray(tag), "OJIMPO-X2D-01", _NoCatalog()) for tag in tags]
 
         assert all(s is not None for s in synced)
         assert [s["extra"]["tag"] for s in synced] == [json.dumps(t) for t in tags]
@@ -329,3 +351,21 @@ class TestWhenRegistrationItselfFails:
         result = await client.create_spool(filament_id=7, extra={"tag": json.dumps("B")})
 
         assert result["extra"]["tag"] == json.dumps("B")
+
+
+class TestAutoCreatedSpoolSize:
+    """A spool auto-created from the AMS is the size the tray reports. Left
+    off, Spoolman copies the filament's weight: a 250 g refill matched to a
+    1000 g filament was created as a 1000 g spool with 250 g left (#3194)."""
+
+    @pytest.mark.asyncio
+    async def test_the_spool_takes_the_trays_own_weight(self):
+        fake = FakeSpoolman()
+        client = _client(fake)
+        tray = _tray("D144798DEF394926ACAE9D69ABA910CC")
+        tray.tray_weight = 250
+
+        result = await client.sync_ams_tray(tray, "OJIMPO-X2D-01", _NoCatalog())
+
+        assert result["initial_weight"] == 250
+        assert result["remaining_weight"] == 250

@@ -41,7 +41,13 @@ export interface SpoolFormData {
   // User-defined category + per-spool low-stock threshold override (#729).
   category: string;
   low_stock_threshold_pct: number | null;
+  // Internal material / article number (#2870) — the purchasing identifier
+  // shared by all spools of the same product. Free text.
+  material_number: string;
   location_id: number | null;
+  // Last drying (#2863), as a datetime-local value in the browser's time zone.
+  // Empty means never dried. Only shown and sent when editing.
+  last_dried_at: string;
   // When set the spool is linked to a specific Spoolman filament catalog entry;
   // the backend skips find_or_create_filament() and uses this ID directly.
   spoolman_filament_id: number | null;
@@ -64,7 +70,9 @@ export const defaultFormData: SpoolFormData = {
   cost_per_kg: null,
   category: '',
   low_stock_threshold_pct: null,
+  material_number: '',
   location_id: null,
+  last_dried_at: '',
   spoolman_filament_id: null,
 };
 
@@ -207,18 +215,26 @@ export interface AdditionalSectionProps extends SectionProps {
   // datalist so users naturally re-use existing names instead of creating
   // near-duplicates ("Production" vs "production" vs "prod"). #729
   availableCategories: string[];
+  // Material numbers already used on other spools — same autocomplete idea
+  // as availableCategories, for the internal article number (#2870).
+  availableMaterialNumbers: string[];
   // Global low-stock threshold (%); shown as placeholder on the per-spool
   // override input so users see what they're overriding. #729
   globalLowStockThreshold: number;
   availableLocations?: { id: number; name: string }[];
   onCreateLocation?: (name: string) => Promise<{ id: number; name: string } | null>;
-  // When true the empty-spool weight is managed by Spoolman on the filament
-  // object, so SpoolWeightPicker is hidden and an info notice is shown instead.
+  // When true the "Last dried" field is shown. Edit mode only: a new spool
+  // has no drying record to correct (#2863).
+  showLastDried?: boolean;
+  // When true the material number input is hidden: in Spoolman mode the
+  // number is Spoolman's filament-level article_number, maintained in
+  // Spoolman itself and shown read-only in the list (#2870).
   spoolmanMode?: boolean;
 }
 
 // PA Profile section props
-export interface PAProfileSectionProps extends SectionProps {
+export interface PAProfileSectionProps {
+  formData: SpoolFormData;
   printersWithCalibrations: PrinterWithCalibrations[];
   selectedProfiles: Set<string>;
   setSelectedProfiles: React.Dispatch<React.SetStateAction<Set<string>>>;

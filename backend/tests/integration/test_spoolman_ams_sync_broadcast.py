@@ -48,12 +48,12 @@ def _tray(ams_id: int, tray_id: int):
     return tray
 
 
-async def _run_ams_change(printer_id: int, ams_data: list, *, parsed):
+async def _run_ams_change(printer_id: int, ams_data: list, *, parsed, sync=None):
     """Drive ``on_ams_change`` with Spoolman standing in for the real server.
 
     ``parsed`` maps (ams_id, tray_id) to a parsed tray or ``None`` (empty slot),
     which is the only thing that decides whether the sync treats the slot as
-    occupied or cleared.
+    occupied or cleared. ``sync`` stands in for ``sync_ams_tray``.
     """
     from backend.app.main import on_ams_change
 
@@ -63,14 +63,17 @@ async def _run_ams_change(printer_id: int, ams_data: list, *, parsed):
     spoolman.parse_ams_tray = MagicMock(
         side_effect=lambda ams_id, tray_data: parsed.get((ams_id, int(tray_data.get("id", 0))))
     )
-    spoolman.sync_ams_tray = AsyncMock(return_value={"id": 4242})
+    spoolman.sync_ams_tray = sync or AsyncMock(return_value={"id": 4242})
 
     status = _status(ams_data)
+    ws = MagicMock()
     with (
         patch("backend.app.main.printer_manager") as pm_main,
         patch("backend.app.services.printer_manager.printer_manager") as pm_inv,
         patch("backend.app.main.mqtt_relay") as relay,
-        patch("backend.app.main.ws_manager") as ws,
+        patch("backend.app.main.ws_manager", ws),
+        # The slot writes are announced by the shared writer.
+        patch("backend.app.services.spoolman_slot_sync.ws_manager", ws),
         patch("backend.app.main.get_spoolman_client", AsyncMock(return_value=spoolman)),
         patch(
             "backend.app.services.slot_preset_writer.upsert_slot_preset_for_spoolman_spool",
@@ -124,18 +127,25 @@ async def test_a_synced_slot_is_broadcast(async_client: AsyncClient, printer_fac
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_an_emptied_slot_is_broadcast(async_client: AsyncClient, printer_factory, db_session: AsyncSession):
-    """The row is deleted here; a card still drawing the removed spool is the
-    same bug seen from the other side."""
+    """The row is deleted here -- once the slot has stayed empty for the grace
+    period (#3186) -- and a card still drawing the removed spool is the same
+    bug seen from the other side."""
+    from backend.app.services import slot_unlink_grace
+
     printer = await printer_factory(name="H2C")
     await _enable_spoolman(db_session)
     db_session.add(SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=1, spoolman_spool_id=7))
     await db_session.commit()
 
-    broadcast, _ = await _run_ams_change(
-        printer.id,
-        [{"id": 0, "tray": [{"id": 1}]}],
-        parsed={(0, 1): None},
-    )
+    clock = [1000.0]
+    with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+        await _run_ams_change(printer.id, [{"id": 0, "tray": [{"id": 1}]}], parsed={(0, 1): None})
+        clock[0] += slot_unlink_grace.GRACE_SECONDS
+        broadcast, _ = await _run_ams_change(
+            printer.id,
+            [{"id": 0, "tray": [{"id": 1}]}],
+            parsed={(0, 1): None},
+        )
 
     assert (0, 1) in _slot_events(broadcast)
 

@@ -9,7 +9,7 @@ export function getPrinterImage(model: string | null | undefined): string {
   if (m.includes('h2d')) return '/img/printers/h2d.png';
   if (m.includes('h2c')) return '/img/printers/h2c.png';
   if (m.includes('h2s')) return '/img/printers/h2d.png';
-  if (m.includes('p2s')) return '/img/printers/p1s.png';
+  if (m.includes('p2s')) return '/img/printers/p2s.png';
   if (m.includes('p1s')) return '/img/printers/p1s.png';
   if (m.includes('p1p')) return '/img/printers/p1p.png';
   if (m.includes('a2l') || m === 'n9') return '/img/printers/a2l.png';
@@ -58,6 +58,12 @@ export function getWifiStrength(rssi: number): { labelKey: string; color: string
 
 import type { PrinterStatus, PrintQueueItem } from '../api/client';
 
+/** Gcode states with no print loaded. */
+export const IDLE_PRINTER_STATES = ['IDLE', 'FINISH', 'FAILED'];
+
+/** Gcode states in which a print is loaded or starting (mirrors the backend's ACTIVE_PRINT_STATES). */
+export const ACTIVE_PRINT_STATES = ['RUNNING', 'PAUSE', 'PREPARE', 'SLICING'];
+
 /**
  * True when a queue item aimed at this printer would start now rather than wait.
  *
@@ -70,8 +76,9 @@ import type { PrinterStatus, PrintQueueItem } from '../api/client';
 export function isPrinterCurrentlyDispatchable(status: PrinterStatus | undefined): boolean {
   if (!status?.connected) return false;
   if (status.awaiting_plate_clear) return false;
-  if (status.ams?.some((ams) => ams.dry_time > 0)) return false;
-  return ['IDLE', 'FINISH', 'FAILED'].includes(status.state ?? '');
+  // A parked drying timer (#2896) never ends, so it does not hold a print back.
+  if (status.ams?.some((ams) => ams.dry_time > 0 && !ams.dry_countdown_stalled)) return false;
+  return IDLE_PRINTER_STATES.includes(status.state ?? '');
 }
 
 /**

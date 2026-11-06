@@ -5,7 +5,7 @@
  * selected during slicing is used when multiple trays have identical filament.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import {
   buildAmsMapping,
@@ -15,7 +15,7 @@ import {
   useFilamentMapping,
 } from '../../hooks/useFilamentMapping';
 import { effectivePreferLowest } from '../../utils/amsHelpers';
-import { getColorName } from '../../utils/colors';
+import { getColorName, setColorCatalog, __resetColorCatalogForTests } from '../../utils/colors';
 import type { PrinterStatus } from '../../api/client';
 
 // Helper to create a minimal printer status with AMS data
@@ -60,6 +60,17 @@ describe('buildLoadedFilaments', () => {
       globalTrayId: 1,
       trayInfoIdx: 'GFA01',
     });
+  });
+
+  it('tells AMS-HT by its unit id, not by a one-tray list', () => {
+    const status = createPrinterStatus([
+      { id: 1, tray: [{ id: 0, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00' }] },
+      { id: 128, tray: [{ id: 0, tray_type: 'PETG', tray_color: '00FF00', tray_info_idx: 'GFG00' }] },
+    ] as PrinterStatus['ams']);
+
+    const result = buildLoadedFilaments(status);
+
+    expect(result.map(f => [f.globalTrayId, f.isHt])).toEqual([[4, false], [128, true]]);
   });
 
   it('includes tray_info_idx from AMS trays', () => {
@@ -394,6 +405,82 @@ describe('computeAmsMapping', () => {
     const result = computeAmsMapping(reqs, status);
 
     expect(result).toEqual([254]);  // External spool global ID
+  });
+});
+
+describe('buildLoadedFilaments - slot colour for the picker (#3159)', () => {
+  it('carries the bound spool\'s extra stops and effect onto the slot', () => {
+    // A tray record holds one hex and nothing else, so a two-tone or glittery
+    // spool would draw as its base colour in the Print dialog's slot picker.
+    // The binding is the only place the rest of the colour exists.
+    const status = createPrinterStatus([
+      { id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00' }] },
+    ]);
+    const slotSpools = new Map([
+      [
+        0,
+        {
+          brand: 'eSUN',
+          material: 'PLA',
+          subtype: 'Multicolor',
+          color_name: 'Rainbow',
+          rgba: 'FF0000FF',
+          extra_colors: '00FF00,0000FF',
+          effect_type: null,
+        },
+      ],
+    ]);
+
+    const [slot] = buildLoadedFilaments(status, slotSpools);
+
+    expect(slot).toMatchObject({
+      extraColors: '00FF00,0000FF',
+      spoolSubtype: 'Multicolor',
+      colorName: 'Rainbow',
+    });
+    expect(slot.effectType).toBeUndefined();
+  });
+
+  it('leaves a slot with no binding to its own tray colour', () => {
+    // Configure Slot / set-on-the-printer slots have no inventory spool behind
+    // them. The firmware reports no stops and never will, so the picker draws a
+    // solid swatch -- which is the honest one, not a missing feature.
+    const status = createPrinterStatus([
+      { id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: '00AAFFFF', tray_info_idx: 'GFA00' }] },
+    ]);
+
+    const [slot] = buildLoadedFilaments(status);
+
+    expect(slot.color).toBe('#00AAFF');
+    expect(slot.extraColors).toBeUndefined();
+    expect(slot.effectType).toBeUndefined();
+    expect(slot.spoolSubtype).toBeUndefined();
+  });
+
+  it('carries them for the external spool holder too', () => {
+    const status = createPrinterStatus(
+      [],
+      [{ id: 254, tray_type: 'PLA', tray_color: 'AABBCCFF', tray_info_idx: 'GFA00' }] as PrinterStatus['vt_tray'],
+    );
+    const slotSpools = new Map([
+      [
+        254,
+        {
+          brand: 'Devil Design',
+          material: 'PLA',
+          subtype: 'Galaxy',
+          color_name: 'Galaxy Black',
+          rgba: 'AABBCCFF',
+          extra_colors: null,
+          effect_type: 'Glitter',
+        },
+      ],
+    ]);
+
+    const [slot] = buildLoadedFilaments(status, slotSpools);
+
+    expect(slot.effectType).toBe('Glitter');
+    expect(slot.spoolSubtype).toBe('Galaxy');
   });
 });
 
@@ -1142,7 +1229,7 @@ describe('effectivePreferLowest gate (#1766)', () => {
     expect(effectivePreferLowest(true, true)).toBe(true);
   });
 
-  it('passes through when backup is unknown (null/undefined — A1 family)', () => {
+  it('passes through when backup is unknown (null/undefined)', () => {
     expect(effectivePreferLowest(true, null)).toBe(true);
     expect(effectivePreferLowest(true, undefined)).toBe(true);
   });
@@ -1535,5 +1622,32 @@ describe('buildLoadedFilaments — naming a slot after its bound spool', () => {
     expect(slot.isExternal).toBe(true);
     expect(slot.spoolName).toBe('Devil Design PLA Basic');
     expect(slot.colorName).toBe('Orange');
+  });
+});
+
+describe('buildLoadedFilaments — a slot set on the printer screen (#3279)', () => {
+  afterEach(() => {
+    __resetColorCatalogForTests();
+  });
+
+  it("names the slot from its preset's range when the printer sends no sub-brand", () => {
+    __resetColorCatalogForTests();
+    setColorCatalog(
+      {},
+      {},
+      [
+        { hex: 'ff9016', name: 'Pumpkin Orange', material: 'PLA Basic' },
+        { hex: 'ff911a', name: 'Translucent Orange', material: 'PETG Translucent' },
+      ],
+      { GFG01: 'PETG Translucent' },
+    );
+    const status = createPrinterStatus(
+      [{ id: 0, tray: [{ id: 0, tray_type: 'PETG', tray_color: 'FF9017FF', tray_info_idx: 'GFG01' }] }],
+      [{ id: 254, tray_type: 'PETG', tray_color: 'FF9017FF', tray_info_idx: 'GFG01' }],
+    );
+
+    const names = buildLoadedFilaments(status).map((f) => f.colorName);
+
+    expect(names).toEqual(['Translucent Orange', 'Translucent Orange']);
   });
 });

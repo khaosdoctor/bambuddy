@@ -67,11 +67,12 @@ describe('InventoryPage — header layout', () => {
       expect(group.querySelector('button')).toBeInTheDocument();
     });
 
-    // Without this the group is as wide as all five buttons laid end to end,
+    // Without this the group is as wide as all its buttons laid end to end,
     // whatever the viewport is.
     expect(group.className).toContain('flex-wrap');
-    // All five actions stay in that one group -- wrapping them is the fix,
-    // hiding any of them is not.
-    expect(group.querySelectorAll('button')).toHaveLength(5);
+    // All seven actions (CSV import/export, Locations, Suppliers (#2988),
+    // labels, assign by QR (#1574), add) stay in that one group -- wrapping
+    // them is the fix, hiding any of them is not.
+    expect(group.querySelectorAll('button')).toHaveLength(7);
   });
 });

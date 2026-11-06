@@ -132,6 +132,7 @@ async def nfc_poll_loop(config: Config, api: APIClient, shared: dict):
                     tray_uuid=event_data.get("tray_uuid"),
                     sak=event_data.get("sak"),
                     tag_type=event_data.get("tag_type"),
+                    raw_blocks=event_data.get("raw_blocks"),
                 )
             elif event_type == "tag_removed":
                 await api.tag_removed(
@@ -238,6 +239,58 @@ async def scale_poll_loop(config: Config, api: APIClient, shared: dict):
         scale.close()
 
 
+async def _register(config: Config, api: APIClient, nfc, scale, display, ip: str) -> None:
+    """Register with the backend (retries until it answers) and take its
+    calibration. At startup, and again when the device was unregistered."""
+    reg = await api.register_device(
+        device_id=config.device_id,
+        hostname=config.hostname,
+        ip_address=ip,
+        firmware_version=__version__,
+        has_nfc=True,
+        has_scale=True,
+        tare_offset=config.tare_offset,
+        calibration_factor=config.calibration_factor,
+        nfc_reader_type=nfc.reader_type if nfc else None,
+        nfc_connection=nfc.connection if nfc else None,
+        backend_url=config.backend_url,
+        has_backlight=display.has_backlight,
+    )
+
+    # Merge server-side calibration with locally-persisted values.
+    # Backend wins when it has non-zero values; local .env wins otherwise
+    # so a "calibrate once" tare survives daemon restarts even if the
+    # backend loses or resets its copy.
+    if reg:
+        backend_tare = reg.get("tare_offset", 0)
+        backend_cal = reg.get("calibration_factor", 0.0)
+
+        if backend_tare:
+            config.tare_offset = backend_tare
+        if backend_cal:
+            config.calibration_factor = backend_cal
+
+        if scale:
+            scale.update_calibration(config.tare_offset, config.calibration_factor)
+
+        # Persist the resolved values locally
+        env_path = _spoolbuddy_env_path()
+        if config.tare_offset:
+            _set_env_value(env_path, "SPOOLBUDDY_TARE_OFFSET", str(config.tare_offset))
+        if config.calibration_factor != 1.0:
+            _set_env_value(env_path, "SPOOLBUDDY_CALIBRATION_FACTOR", str(config.calibration_factor))
+
+        # Push local tare to backend if backend had 0 but we have a stored value
+        if not backend_tare and config.tare_offset:
+            logger.info("Backend has no tare, pushing local tare=%d", config.tare_offset)
+            await api.update_tare(config.device_id, config.tare_offset)
+
+        # Auto-deploy Bambuddy's SSH public key for remote updates
+        ssh_key = reg.get("ssh_public_key")
+        if ssh_key:
+            _deploy_ssh_key(ssh_key)
+
+
 async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shared: dict):
     """Periodic heartbeat to keep device registered and pick up commands."""
     display: DisplayControl = shared["display"]
@@ -262,6 +315,14 @@ async def heartbeat_loop(config: Config, api: APIClient, start_time: float, shar
             backend_url=config.backend_url,
             system_stats=stats,
         )
+
+        if api.unregistered is True:
+            # An admin removed the device while it kept running: register again
+            # so it reappears (the route's documented behaviour).
+            logger.info("Backend no longer knows this device, registering again")
+            api.unregistered = False
+            await _register(config, api, nfc, scale, display, ip)
+            continue
 
         if result:
             ssh_key = result.get("ssh_public_key")
@@ -494,52 +555,7 @@ async def main():
     display = DisplayControl()
 
     # Register with backend (retries until success)
-    reg = await api.register_device(
-        device_id=config.device_id,
-        hostname=config.hostname,
-        ip_address=ip,
-        firmware_version=__version__,
-        has_nfc=True,
-        has_scale=True,
-        tare_offset=config.tare_offset,
-        calibration_factor=config.calibration_factor,
-        nfc_reader_type=nfc.reader_type,
-        nfc_connection=nfc.connection,
-        backend_url=config.backend_url,
-        has_backlight=display.has_backlight,
-    )
-
-    # Merge server-side calibration with locally-persisted values.
-    # Backend wins when it has non-zero values; local .env wins otherwise
-    # so a "calibrate once" tare survives daemon restarts even if the
-    # backend loses or resets its copy.
-    if reg:
-        backend_tare = reg.get("tare_offset", 0)
-        backend_cal = reg.get("calibration_factor", 0.0)
-
-        if backend_tare:
-            config.tare_offset = backend_tare
-        if backend_cal:
-            config.calibration_factor = backend_cal
-
-        scale.update_calibration(config.tare_offset, config.calibration_factor)
-
-        # Persist the resolved values locally
-        env_path = _spoolbuddy_env_path()
-        if config.tare_offset:
-            _set_env_value(env_path, "SPOOLBUDDY_TARE_OFFSET", str(config.tare_offset))
-        if config.calibration_factor != 1.0:
-            _set_env_value(env_path, "SPOOLBUDDY_CALIBRATION_FACTOR", str(config.calibration_factor))
-
-        # Push local tare to backend if backend had 0 but we have a stored value
-        if not backend_tare and config.tare_offset:
-            logger.info("Backend has no tare, pushing local tare=%d", config.tare_offset)
-            await api.update_tare(config.device_id, config.tare_offset)
-
-        # Auto-deploy Bambuddy's SSH public key for remote updates
-        ssh_key = reg.get("ssh_public_key")
-        if ssh_key:
-            _deploy_ssh_key(ssh_key)
+    await _register(config, api, nfc, scale, display, ip)
 
     logger.info("Device registered, starting poll loops")
 

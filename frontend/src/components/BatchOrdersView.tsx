@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Package, Layers, PlayCircle, XCircle, AlertTriangle, Clock, Coins } from 'lucide-react';
 import { api } from '../api/client';
@@ -9,12 +9,15 @@ import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
 import { formatDuration, parseUTCDate } from '../utils/date';
 import { getCurrencySymbol } from '../utils/currency';
+import { useUiSettings } from '../hooks/useUiSettings';
 
-type StatusFilter = 'active' | 'completed' | 'cancelled' | 'all';
+type StatusFilter = 'active' | 'completed' | 'failed' | 'cancelled' | 'all';
 
 interface BatchOrdersViewProps {
   hasPermission: (p: Permission) => boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
+  /** A batch to scroll to and highlight (``/queue?batch=<id>``, e.g. from Bambuddy Orders). */
+  focusBatchId?: number | null;
 }
 
 /**
@@ -26,19 +29,25 @@ interface BatchOrdersViewProps {
  * against what has actually been produced — including the runs that failed and
  * are therefore still owed.
  */
-export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
+export function BatchOrdersView({ hasPermission, t, focusBatchId = null }: BatchOrdersViewProps) {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active');
+  // A linked batch may be finished or cancelled: show every status so it's there.
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(focusBatchId ? 'all' : 'active');
   const [cancelTarget, setCancelTarget] = useState<PrintBatch | null>(null);
 
-  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const { data: settings } = useUiSettings();
   const currency = getCurrencySymbol(settings?.currency || 'USD');
 
   const { data: batches, isLoading } = useQuery({
     queryKey: ['batches', statusFilter],
     queryFn: () => api.getBatches(statusFilter === 'all' ? undefined : statusFilter),
   });
+
+  const focusFound = focusBatchId != null && !!batches?.some((b) => b.id === focusBatchId);
+  useEffect(() => {
+    if (focusFound) document.getElementById(`batch-${focusBatchId}`)?.scrollIntoView({ block: 'center' });
+  }, [focusFound, focusBatchId]);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['batches'] });
@@ -68,7 +77,7 @@ export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
   const canDispatch = hasPermission('queue:create' as Permission);
   const canCancel = hasPermission('queue:delete_all' as Permission);
 
-  const filters: StatusFilter[] = ['active', 'completed', 'cancelled', 'all'];
+  const filters: StatusFilter[] = ['active', 'completed', 'failed', 'cancelled', 'all'];
 
   return (
     <div>
@@ -111,6 +120,7 @@ export function BatchOrdersView({ hasPermission, t }: BatchOrdersViewProps) {
               canDispatch={canDispatch}
               canCancel={canCancel}
               isDispatching={dispatchMutation.isPending && dispatchMutation.variables?.id === batch.id}
+              highlighted={batch.id === focusBatchId}
               onDispatch={(plateId) => dispatchMutation.mutate({ id: batch.id, plateId })}
               onCancel={() => setCancelTarget(batch)}
               t={t}
@@ -137,6 +147,8 @@ const STATUS_STYLES: Record<string, string> = {
   active: 'bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-300',
   completed: 'bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-300',
   cancelled: 'bg-bambu-dark-tertiary text-bambu-gray',
+  // A grouping whose jobs ended in failures with nothing printed.
+  failed: 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-300',
 };
 
 function BatchOrderCard({
@@ -148,6 +160,7 @@ function BatchOrderCard({
   onDispatch,
   onCancel,
   t,
+  highlighted = false,
 }: {
   batch: PrintBatch;
   currency: string;
@@ -157,6 +170,7 @@ function BatchOrderCard({
   onDispatch: (plateId?: number | null) => void;
   onCancel: () => void;
   t: (key: string, options?: Record<string, unknown>) => string;
+  highlighted?: boolean;
 }) {
   // Progress is measured against the target, not against what was queued —
   // that is the whole difference between an order and a grouping.
@@ -170,7 +184,7 @@ function BatchOrderCard({
   const isOverdue = dueDate != null && batch.status === 'active' && dueDate.getTime() < Date.now();
 
   return (
-    <Card className="p-4">
+    <Card id={`batch-${batch.id}`} className={`p-4 ${highlighted ? 'ring-2 ring-bambu-green' : ''}`}>
       <div className="flex flex-wrap items-start gap-3 mb-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
@@ -225,7 +239,7 @@ function BatchOrderCard({
         <div className="flex-1 h-2 bg-bambu-dark-tertiary rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all ${
-              batch.status === 'completed' ? 'bg-bambu-green' : 'bg-blue-500'
+              batch.status === 'completed' ? 'bg-bambu-green' : batch.status === 'failed' ? 'bg-red-500' : 'bg-blue-500'
             }`}
             style={{ width: `${Math.min(100, percent)}%` }}
           />

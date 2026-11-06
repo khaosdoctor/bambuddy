@@ -148,6 +148,8 @@ class TestGetInventoryRemain:
                 # Present even when there is nothing to say, so the client can
                 # branch on the field rather than on its absence.
                 "spool": None,
+                # Unpriced: the dialog's estimate uses the default rate.
+                "cost_per_kg": None,
             }
         ]
 
@@ -206,4 +208,8 @@ class TestGetInventoryRemain:
             "subtype": "Basic",
             "color_name": "Orange",
             "rgba": "FEC600FF",
+            # The rest of the colour, for the slot picker's swatch (#3159).
+            # None here: this spool is a single flat colour.
+            "extra_colors": None,
+            "effect_type": None,
         }

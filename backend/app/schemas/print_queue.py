@@ -1,8 +1,10 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, Field, PlainSerializer, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, PlainSerializer, model_validator
 
+from backend.app.schemas.not_null import IgnoresNullForRequiredColumns
+from backend.app.utils.local_time import to_naive_utc
 from backend.app.utils.printer_models import MAX_CHAMBER_TEMP_C
 
 
@@ -15,6 +17,19 @@ def serialize_utc_datetime(dt: datetime | None) -> str | None:
 
 
 UTCDatetime = Annotated[datetime | None, PlainSerializer(serialize_utc_datetime)]
+
+
+def _naive_utc(value: datetime | None) -> datetime | None:
+    try:
+        return to_naive_utc(value)
+    except OverflowError:
+        # At the edge of the date range: a 422, not a 500.
+        raise ValueError("date is out of range") from None
+
+
+# Coerces any client-sent UTC offset to the naive UTC the DB stores. Without
+# it the offset was dropped, not converted: 10:00+02:00 was stored as 10:00 UTC.
+NaiveUTCDatetime = Annotated[datetime | None, AfterValidator(_naive_utc)]
 
 
 def _coerce_tristate(v: object) -> object:
@@ -76,11 +91,11 @@ class PrintQueueItemCreate(BaseModel):
     # Either archive_id OR library_file_id must be provided
     archive_id: int | None = None
     library_file_id: int | None = None
-    scheduled_time: datetime | None = None  # None = ASAP (next when idle)
+    scheduled_time: NaiveUTCDatetime = None  # None = ASAP (next when idle)
     require_previous_success: bool = False
     auto_off_after: bool = False  # Power off printer after print completes
     manual_start: bool = False  # Requires manual trigger to start (staged)
-    insert_at_top: bool = False  # Insert ahead of other pending items in the same queue scope
+    insert_at_top: bool = False  # Insert ahead of other pending items (one queue order across all printers, #3200)
     insert_position: int | None = None  # 1-indexed insertion position for priority queueing
     # Persistent "Print Anyway" acknowledgement (#1698-followup). When set,
     # PrintModal already showed the deficit warning and the user confirmed,
@@ -103,6 +118,8 @@ class PrintQueueItemCreate(BaseModel):
     # Nozzle offset calibration — dual-nozzle printers only (#1682). The MQTT
     # layer ignores the value on single-nozzle printers so the wire stays "skip".
     nozzle_offset_cali: TriState = "auto"
+    # Ask for a post-print outcome verdict when this job completes (#1898)
+    confirm_outcome: bool = False
     # Preheat / heat-soak per-item override (#1468). 'inherit' uses the global
     # preheat_enabled setting; 'on' / 'off' force the decision. The chamber
     # target falls through: this override → max(filament-map[loaded tray]) → 0.
@@ -135,16 +152,20 @@ class PrintQueueItemCreate(BaseModel):
     variants: list[QueueVariantCreate] | None = None
 
 
-class PrintQueueItemUpdate(BaseModel):
+class PrintQueueItemUpdate(IgnoresNullForRequiredColumns):
+    __orm_table__ = "print_queue"
     printer_id: int | None = None
     target_model: str | None = None  # Target printer model (mutually exclusive with printer_id)
     target_location: str | None = None  # Target location filter (only used with target_model)
     filament_overrides: list[dict] | None = None  # Filament overrides for model-based assignment
     position: int | None = None
-    scheduled_time: datetime | None = None
+    scheduled_time: NaiveUTCDatetime = None
     require_previous_success: bool | None = None
     auto_off_after: bool | None = None
     manual_start: bool | None = None
+    # Set by the print dialog when the mapping deliberately puts a slot on a
+    # tray of another material, so the dispatch re-check keeps it (#2799).
+    skip_filament_check: bool | None = None
     ams_mapping: list[int] | None = None
     plate_id: int | None = None
     # Print options
@@ -155,6 +176,7 @@ class PrintQueueItemUpdate(BaseModel):
     timelapse: bool | None = None
     use_ams: bool | None = None
     nozzle_offset_cali: TriState | None = None
+    confirm_outcome: bool | None = None
     preheat_override: Literal["inherit", "on", "off"] | None = None
     preheat_chamber_target_override: int | None = Field(default=None, ge=0, le=MAX_CHAMBER_TEMP_C)
     # Auto-print G-code injection
@@ -178,6 +200,16 @@ class QueueVariantSummary(BaseModel):
     filename: str
     target_model: str
     position: int
+
+
+class ColorSubstitution(BaseModel):
+    """A slot sent with a spool of another colour than the file asked for (#3279)."""
+
+    slot_id: int
+    type: str
+    wanted: str
+    got: str
+    tray: int
 
 
 class PrintQueueItemResponse(BaseModel):
@@ -215,6 +247,7 @@ class PrintQueueItemResponse(BaseModel):
     timelapse: bool = False
     use_ams: bool = True
     nozzle_offset_cali: TriState = "auto"
+    confirm_outcome: bool = False
     preheat_override: Literal["inherit", "on", "off"] = "inherit"
     preheat_chamber_target_override: int | None = None
     status: Literal["pending", "printing", "completed", "failed", "skipped", "cancelled"]
@@ -284,8 +317,31 @@ class PrintQueueItemResponse(BaseModel):
     # live rack at dispatch; null means "assign them for me".
     nozzle_rack_choice: dict[int, int] | None = None
 
+    # Slots that printed in another colour than the file asked for (#3279).
+    color_substitutions: list[ColorSubstitution] | None = None
+
     class Config:
         from_attributes = True
+
+
+class PrintQueueHistoryResponse(BaseModel):
+    """One page of the queue history, plus what the page needs around it.
+
+    ``items`` holds the page in display order, followed by any other history
+    runs of the batches on that page, so a batch row can count all of its runs.
+    """
+
+    items: list[PrintQueueItemResponse]
+    # Matching history items in all, not just this page.
+    total: int
+    # Every target_location in the caller's history, for the location filter.
+    locations: list[str]
+
+
+class PrintQueueHistoryClearResponse(BaseModel):
+    cleared: int
+    # Runs a batch order still needs, cancelled rather than deleted (#2960).
+    kept: int
 
 
 class PrintQueueReorderItem(BaseModel):
@@ -321,13 +377,15 @@ class PrintQueueReorder(BaseModel):
         return self
 
 
-class PrintQueueBulkUpdate(BaseModel):
+class PrintQueueBulkUpdate(IgnoresNullForRequiredColumns):
     """Bulk update multiple queue items with the same values."""
+
+    __orm_table__ = "print_queue"
 
     item_ids: list[int]
     # Fields to update (all optional - only set fields are applied)
     printer_id: int | None = None
-    scheduled_time: datetime | None = None
+    scheduled_time: NaiveUTCDatetime = None
     require_previous_success: bool | None = None
     auto_off_after: bool | None = None
     manual_start: bool | None = None
@@ -339,6 +397,7 @@ class PrintQueueBulkUpdate(BaseModel):
     timelapse: bool | None = None
     use_ams: bool | None = None
     nozzle_offset_cali: TriState | None = None
+    confirm_outcome: bool | None = None
     preheat_override: Literal["inherit", "on", "off"] | None = None
     preheat_chamber_target_override: int | None = Field(default=None, ge=0, le=MAX_CHAMBER_TEMP_C)
     # Auto-print G-code injection
@@ -389,14 +448,29 @@ class PrintBatchCreate(BaseModel):
     project_id: int | None = None
     due_date: datetime | None = None
     notes: str | None = None
+    # The external record this batch fulfils, for integrations. ``external_ref``
+    # is unique within ``external_source``: creating a second batch with the
+    # same pair is a 409, which makes a retried create safe.
+    external_source: str | None = Field(default=None, min_length=1, max_length=32, pattern=r"^[a-z0-9_-]+$")
+    external_ref: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def _external_link_is_complete(self) -> "PrintBatchCreate":
+        # A ref without its source can't be looked up, and a source without a
+        # ref would escape the uniqueness guarantee (NULLs never collide).
+        if (self.external_source is None) != (self.external_ref is None):
+            raise ValueError("external_source and external_ref must be given together")
+        return self
 
 
-class PrintBatchUpdate(BaseModel):
+class PrintBatchUpdate(IgnoresNullForRequiredColumns):
     """Edit an order's header or its per-plate targets while it runs.
 
     Every field is optional; ``plates`` replaces the full target set when
     given, so a plate omitted from the list has its target row removed.
     """
+
+    __orm_table__ = "print_batches"
 
     name: str | None = None
     status: Literal["active", "cancelled"] | None = None
@@ -465,6 +539,8 @@ class PrintBatchResponse(BaseModel):
     project_id: int | None = None
     due_date: UTCDatetime | None = None
     notes: str | None = None
+    external_source: str | None = None
+    external_ref: str | None = None
     # Derived counts
     pending_count: int = 0
     printing_count: int = 0

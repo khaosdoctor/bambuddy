@@ -4,6 +4,7 @@
  * for AMS, AMS-HT, and external spool configurations.
  */
 import { parseUTCDate } from './date';
+import { settingIdToFilamentId } from './filamentIds';
 
 /**
  * Normalize color format from various sources for CSS rendering.
@@ -76,11 +77,9 @@ export function resolveSlotExtruder(
 /**
  * AMS unit label using the codebase convention: "AMS-A / AMS-B / ..." for
  * regular AMS, "HT-A / HT-B / ..." for AMS-HT (single-tray modules with
- * IDs starting at 128). `trayCount` is required because the type can't be
- * inferred from the id alone — regular AMS IDs 0-3 can collide with the
- * normalized HT range otherwise.
+ * IDs 128-135). The unit id decides: a regular AMS can report one tray.
  */
-export function getAmsLabel(amsId: number | string, trayCount: number): string {
+export function getAmsLabel(amsId: number | string): string {
   const id = typeof amsId === 'string' ? parseInt(amsId, 10) : amsId;
   const safeId = isNaN(id) ? 0 : id;
   if (safeId === 255) return 'External';
@@ -88,7 +87,7 @@ export function getAmsLabel(amsId: number | string, trayCount: number): string {
   // ingest (see a2l-am-unit-16). No regular AMS uses id 6, so this is a safe,
   // self-scoping label for the Lite's 4-slot unit.
   if (safeId === 6) return 'AMS Lite';
-  const isHt = trayCount === 1;
+  const isHt = isAmsHtUnit(safeId);
   const normalizedId = safeId >= 128 ? safeId - 128 : safeId;
   const letter = String.fromCharCode(65 + normalizedId);
   return isHt ? `HT-${letter}` : `AMS-${letter}`;
@@ -326,6 +325,32 @@ export function findNearestSimilar<T>(
   return best;
 }
 
+/** Classify an empty AMS slot for UI rendering (#1322 follow-up).
+ *
+ *  "physical" — firmware positively confirmed no spool (state 9 or 10). The
+ *  bambu_mqtt handler now promotes tray_exist_bits=0 slots to state=9, so
+ *  every empty-by-bitmask slot lands here regardless of firmware payload
+ *  shape.
+ *
+ *  "reset" — tray_type is missing/empty but firmware hasn't confirmed
+ *  emptiness (state is null, 3, or any non-9/10 value). Typically a slot
+ *  the user cleared with "Reset Slot" where a physical spool may still be
+ *  loaded but unassigned.
+ *
+ *  Returns null when the slot is loaded (tray_type is present).
+ */
+export function getEmptySlotKind(tray: { tray_type?: string | null; state?: number | null; exists?: boolean | null } | null | undefined): 'physical' | 'reset' | null {
+  if (tray?.tray_type) return null;
+  // tray_exist_bits is firmware's authoritative presence signal: a non-RFID
+  // spool the firmware can't identify is physically present (exists === true)
+  // but carries no tray_type, so it must read as "?" (loaded, unconfigured),
+  // never "Empty" (#2527). BambuStudio draws it the same way. Only fall back to
+  // the state=9/10 heuristic when the bitmask was unavailable (exists == null).
+  if (tray?.exists === true) return 'reset';
+  if (tray?.exists === false) return 'physical';
+  return (tray?.state === 9 || tray?.state === 10) ? 'physical' : 'reset';
+}
+
 /**
  * Format slot label for display in the UI.
  * @param amsId - AMS unit ID (0-3 for regular AMS, 128+ for AMS-HT)
@@ -364,6 +389,46 @@ export function getGlobalTrayId(
   // AMS-HT units have IDs starting at 128 with a single tray — use ID directly
   if (amsId >= 128) return amsId;
   return amsId * 4 + trayId;
+}
+
+/**
+ * AMS-HT units are ids 128-135, one tray each. The id decides, not the tray
+ * count: a regular AMS can report fewer than four trays.
+ */
+export function isAmsHtUnit(amsId: number): boolean {
+  return amsId >= 128 && amsId <= 135;
+}
+
+/**
+ * The tray reported for a slot of a regular AMS, by its tray id. An AMS can
+ * report only some of its trays, and then a position in the list is not the
+ * slot. Only when the ids do not tell the trays apart (a firmware that sends
+ * none: they all read 0) does the position decide.
+ */
+export function trayForSlot<T extends { id: number }>(trays: T[], slotIdx: number): T | undefined {
+  const idsUsable = new Set(trays.map(tray => tray.id)).size === trays.length;
+  return idsUsable ? trays.find(tray => tray.id === slotIdx) : trays[slotIdx];
+}
+
+/**
+ * Whether some spool of this AMS is threaded into the feed tube. The AMS turns
+ * its spools together, so one loaded slot keeps it from rotating them while
+ * drying (the firmware refuses with dry_sf_reason 3, consumable at AMS outlet).
+ *
+ * Tray state 11 means loaded, but not on every firmware, so the slot the
+ * printer reports as loaded (tray_now) counts too, and on a two-nozzle printer
+ * the slot each hotend is fed from (extruder_slots), since tray_now names only
+ * the active nozzle's.
+ */
+export function amsHasLoadedTray(
+  ams: { id: number; tray: { id: number; state?: number | null }[] } | undefined,
+  trayNow: number | null | undefined,
+  extruderSlots: Record<string, { ams_id: number | null; has_filament: boolean }> | null | undefined,
+): boolean {
+  if (!ams) return false;
+  if (ams.tray.some(tray => tray.state === 11)) return true;
+  if (trayNow != null && ams.tray.some(tray => getGlobalTrayId(ams.id, tray.id, false) === trayNow)) return true;
+  return Object.values(extruderSlots ?? {}).some(slot => slot.ams_id === ams.id && slot.has_filament);
 }
 
 /**
@@ -412,16 +477,6 @@ function hashSerialToHex32(serial: string): string {
  */
 export function getFallbackSpoolTag(printerSerial: string, amsId: number, trayId: number): string {
   return `${hashSerialToHex32(printerSerial)}${toFixedHex(amsId, 4)}${toFixedHex(trayId, 4)}`;
-}
-
-/**
- * Get minimum datetime for scheduling (now + 1 minute).
- * Returns ISO string format for datetime-local input.
- */
-export function getMinDateTime(): string {
-  const now = new Date();
-  now.setMinutes(now.getMinutes() + 1);
-  return now.toISOString().slice(0, 16);
 }
 
 /**
@@ -649,15 +704,25 @@ export function isBambuLabSpool(tray: {
  * and a local preset (`local_68`) has no printer-side id at all, so neither can
  * be checked here and both keep the stored name. Same for a slot reporting no
  * id (generic filament with no tag), which is the case the row exists for.
+ *
+ * Rows written since #3216 also record the filament id the slot was given
+ * with the preset (`presetTrayInfoIdx`). That settles every kind of preset:
+ * once the printer reports a different id, something else — the slicer's
+ * Device tab, the printer's screen — re-configured the slot, and the row no
+ * longer describes it.
  */
 export function slotPresetDescribesTray(
   presetId: string | null | undefined,
   trayInfoIdx: string | null | undefined,
+  presetTrayInfoIdx?: string | null,
 ): boolean {
   const preset = (presetId || '').split('_')[0].toUpperCase();
   const tray = (trayInfoIdx || '').split('_')[0].toUpperCase();
-  if (!preset.startsWith('GFS') || !tray.startsWith('GF') || tray.startsWith('GFS')) return true;
-  return `GF${preset.slice(3)}` === tray;
+  const recorded = (presetTrayInfoIdx || '').split('_')[0].toUpperCase();
+  if (recorded && tray) return recorded === tray;
+  if (!preset.startsWith('GFS') || !tray.startsWith('GF')) return true;
+  // The full id, suffix included, decides some presets' filament_id (#3387).
+  return settingIdToFilamentId((presetId || '').toUpperCase()) === tray;
 }
 
 export interface AmsTrayLike {

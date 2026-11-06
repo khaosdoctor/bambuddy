@@ -1,11 +1,12 @@
 """Pydantic schemas for notification providers."""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.core.compat import StrEnum
+from backend.app.schemas.not_null import IgnoresNullForRequiredColumns
 
 
 class ProviderType(StrEnum):
@@ -20,6 +21,8 @@ class ProviderType(StrEnum):
     WEBHOOK = "webhook"
     HOMEASSISTANT = "homeassistant"
     BARK = "bark"
+    GOTIFY = "gotify"
+    NOTIFY = "notify"
 
 
 class NotificationProviderBase(BaseModel):
@@ -29,6 +32,9 @@ class NotificationProviderBase(BaseModel):
     provider_type: ProviderType = Field(..., description="Type of notification provider")
     enabled: bool = Field(default=True, description="Whether notifications are enabled")
     config: dict[str, Any] = Field(..., description="Provider-specific configuration")
+    attach_photo: bool = Field(
+        default=True, description="Attach a camera snapshot to this provider's notifications when one is available"
+    )
 
     # Event triggers - print lifecycle
     on_print_start: bool = Field(default=False, description="Notify on print start")
@@ -47,7 +53,7 @@ class NotificationProviderBase(BaseModel):
     on_printer_error: bool = Field(default=False, description="Notify on printer errors (AMS, etc.)")
     on_ai_failure_detection: bool = Field(
         default=False,
-        description="Notify when Obico AI detects a possible print failure (spaghetti)",
+        description="Notify when AI failure detection identifies a possible print failure (spaghetti)",
     )
     on_filament_low: bool = Field(default=False, description="Notify when filament is running low")
     on_maintenance_due: bool = Field(default=False, description="Notify when maintenance is due")
@@ -82,11 +88,28 @@ class NotificationProviderBase(BaseModel):
         default=False, description="Notify when a finished print is waiting for plate-clear confirmation"
     )
 
+    # Event triggers - Post-print outcome confirmation (#1898)
+    on_print_confirm_request: bool = Field(
+        default=True,
+        description="Notify with one-tap verdict links when a print that opted in asks for its outcome",
+    )
+    # How a Telegram provider collects the verdict (#3046). Ignored elsewhere.
+    telegram_verdict_mode: Literal["buttons", "reactions", "both"] = Field(
+        default="buttons",
+        description="Telegram only: answer the outcome prompt via inline buttons, a thumbs reaction, or both",
+    )
+
     # Event triggers - Bed cooled
     on_bed_cooled: bool = Field(default=False, description="Notify when bed cools after print")
 
     # Event triggers - First layer complete
     on_first_layer_complete: bool = Field(default=False, description="Notify when first layer completes")
+
+    # Event triggers - A slicer pause coming up (#2984)
+    on_print_pause_upcoming: bool = Field(default=False, description="Notify before a pause in the print")
+
+    # Messages from connected apps (POST /notifications/app-message)
+    on_app_message: bool = Field(default=False, description="Deliver messages other applications send")
 
     # Event triggers - Inventory stock alerts
     # Missing from this schema until now, so every payload naming them was
@@ -145,13 +168,16 @@ class NotificationProviderCreate(NotificationProviderBase):
     pass
 
 
-class NotificationProviderUpdate(BaseModel):
+class NotificationProviderUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating a notification provider (all fields optional)."""
+
+    __orm_table__ = "notification_providers"
 
     name: str | None = Field(default=None, min_length=1, max_length=100)
     provider_type: ProviderType | None = None
     enabled: bool | None = None
     config: dict[str, Any] | None = None
+    attach_photo: bool | None = None
 
     # Event triggers - print lifecycle
     on_print_start: bool | None = None
@@ -188,11 +214,21 @@ class NotificationProviderUpdate(BaseModel):
     on_plate_not_empty: bool | None = None
     on_plate_clear_required: bool | None = None
 
+    # Event triggers - Post-print outcome confirmation (#1898)
+    on_print_confirm_request: bool | None = None
+    telegram_verdict_mode: Literal["buttons", "reactions", "both"] | None = None
+
     # Event triggers - Bed cooled
     on_bed_cooled: bool | None = None
 
     # Event triggers - First layer complete
     on_first_layer_complete: bool | None = None
+
+    # Event triggers - A slicer pause coming up
+    on_print_pause_upcoming: bool | None = None
+
+    # Messages from connected apps
+    on_app_message: bool | None = None
 
     # Event triggers - Inventory stock alerts
     on_stock_reorder_alert: bool | None = None
@@ -270,11 +306,53 @@ class NotificationProviderResponse(NotificationProviderBase):
         from_attributes = True
 
 
+class AppMessage(BaseModel):
+    """A message another application sends through Bambuddy's notification channels."""
+
+    title: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=2000)
+    url: str | None = Field(default=None, max_length=500, description="A link the message points to (http or https)")
+
+    @field_validator("title", "message")
+    @classmethod
+    def _plain_text(cls, value: str) -> str:
+        # Plain text: no control characters beyond line breaks and tabs.
+        cleaned = "".join(ch for ch in value if ch in "\n\t" or ch.isprintable()).strip()
+        if not cleaned:
+            raise ValueError("must not be empty")
+        return cleaned
+
+    @field_validator("url")
+    @classmethod
+    def _http_url(cls, value: str | None) -> str | None:
+        if value is None or value.strip() == "":
+            return None
+        value = value.strip()
+        if not value.lower().startswith(("http://", "https://")) or any(c.isspace() for c in value):
+            raise ValueError("must be an http or https address")
+        return value
+
+
+class AppMessageResult(BaseModel):
+    channels: int = Field(description="How many channels the message was handed to")
+
+
+class AppMessageChannel(BaseModel):
+    name: str
+    provider_type: str
+
+
 class NotificationTestRequest(BaseModel):
     """Schema for testing notification configuration."""
 
     provider_type: ProviderType
     config: dict[str, Any]
+    attach_photo: bool = Field(
+        default=True, description="Include a sample photo in the test, mirroring the provider's own toggle"
+    )
+    provider_id: int | None = Field(
+        default=None, description="The saved provider being edited: its stored secrets fill in the placeholders"
+    )
 
 
 class NotificationTestResponse(BaseModel):
@@ -282,63 +360,6 @@ class NotificationTestResponse(BaseModel):
 
     success: bool
     message: str
-
-
-# Provider-specific config schemas for documentation/validation reference
-class CallMeBotConfig(BaseModel):
-    """CallMeBot/WhatsApp configuration."""
-
-    phone: str = Field(..., description="Phone number with country code (e.g., +1234567890)")
-    apikey: str = Field(..., description="API key from CallMeBot")
-
-
-class NtfyConfig(BaseModel):
-    """ntfy configuration."""
-
-    server: str = Field(default="https://ntfy.sh", description="ntfy server URL")
-    topic: str = Field(..., description="Topic name to publish to")
-    auth_token: str | None = Field(default=None, description="Optional authentication token")
-    event_priorities: dict[str, int] | None = Field(
-        default=None,
-        description=(
-            "Per-event priority override. Keys are event names, either the provider's "
-            "toggle column ('on_print_failed', what the UI writes) or the bare event "
-            "name ('print_failed'); both are accepted. Values are ntfy priorities 1-5 "
-            "(1=min, 2=low, 3=default, 4=high, 5=urgent). Events without an entry use "
-            "ntfy's server-side default."
-        ),
-    )
-
-
-class PushoverConfig(BaseModel):
-    """Pushover configuration."""
-
-    user_key: str = Field(..., description="Your Pushover user key")
-    app_token: str = Field(..., description="Your Pushover application token")
-    priority: int = Field(default=0, ge=-2, le=2, description="Message priority (-2 to 2)")
-    # Emergency priority (2) only: how often to re-alert and when to stop.
-    # Pushover requires retry >= 30s and expire <= 10800s (3h).
-    retry: int = Field(default=60, ge=30, le=10800, description="Emergency re-alert interval in seconds (priority 2)")
-    expire: int = Field(default=3600, ge=30, le=10800, description="Emergency alert expiry in seconds (priority 2)")
-
-
-class TelegramConfig(BaseModel):
-    """Telegram bot configuration."""
-
-    bot_token: str = Field(..., description="Bot token from @BotFather")
-    chat_id: str = Field(..., description="Chat ID to send messages to")
-
-
-class EmailConfig(BaseModel):
-    """Email/SMTP configuration."""
-
-    smtp_server: str = Field(..., description="SMTP server hostname")
-    smtp_port: int = Field(default=587, description="SMTP port (587 for TLS, 465 for SSL)")
-    username: str = Field(..., description="SMTP username/email")
-    password: str = Field(..., description="SMTP password or app password")
-    from_email: str = Field(..., description="From email address")
-    to_email: str = Field(..., description="Recipient email address")
-    use_tls: bool = Field(default=True, description="Use TLS encryption")
 
 
 # Notification Log schemas

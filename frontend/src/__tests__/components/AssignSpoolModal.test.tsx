@@ -109,6 +109,17 @@ describe('AssignSpoolModal', () => {
     expect(screen.getByText(/Jade White/)).toBeInTheDocument();
   });
 
+  it('shows each spool ID on the assignment card (#2978)', async () => {
+    render(<AssignSpoolModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('#1')).toBeInTheDocument();
+    });
+
+    expect(screen.getByText('#2')).toBeInTheDocument();
+    expect(screen.getByText('#3')).toBeInTheDocument();
+  });
+
   it('renders a clear tray as the transparency checkerboard, not an invisible circle (#2912)', async () => {
     render(
       <AssignSpoolModal
@@ -155,12 +166,11 @@ describe('AssignSpoolModal', () => {
 
     render(<AssignSpoolModal {...defaultProps} />);
 
+    // Spool 1 (assigned to current slot) should still be in the list for
+    // re-assignment — its card, not the "Assigned" line above the list.
     await waitFor(() => {
-      expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Polymaker/ })).toBeInTheDocument();
     });
-
-    // Spool 1 (assigned to current slot) should still be visible for re-assignment
-    expect(screen.getByText(/Polymaker/)).toBeInTheDocument();
   });
 
   // Empty-state premise reworked for #1133: BL spools no longer trigger
@@ -467,6 +477,7 @@ describe('AssignSpoolModal — Spoolman enabled (T-Gap 7)', () => {
       expect(screen.getByText(/Bambu Lab/)).toBeInTheDocument();
     });
     expect(api.getSpoolmanInventorySpools).toHaveBeenCalledWith(false);
+    expect(screen.getByText('#200')).toBeInTheDocument();
   });
 
   it('does not fetch Spoolman spools when spoolmanEnabled=false', async () => {
@@ -491,6 +502,28 @@ describe('AssignSpoolModal — Spoolman enabled (T-Gap 7)', () => {
     });
     // Local spool (Polymaker) must NOT appear in Spoolman mode
     expect(screen.queryByText(/Polymaker/)).not.toBeInTheDocument();
+  });
+
+  it('refreshes the slots it filters "assigned elsewhere" by after an assignment', async () => {
+    const { default: userEvent } = await import('@testing-library/user-event');
+    const user = userEvent.setup();
+    (api.assignSpoolmanSlot as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    const slotsCall = api.getSpoolmanSlotAssignments as ReturnType<typeof vi.fn>;
+    render(
+      <AssignSpoolModal
+        {...defaultProps}
+        spoolmanEnabled
+        trayInfo={{ type: 'PETG', material: 'PETG', profile: 'PETG HF', color: '0000FF', location: 'AMS 1 - Slot 1' }}
+      />
+    );
+
+    await waitFor(() => expect(screen.getByText(/Bambu Lab/)).toBeInTheDocument());
+    const before = slotsCall.mock.calls.length;
+    await user.click(screen.getByText(/Bambu Lab/));
+    await user.click(screen.getByRole('button', { name: /assign spool/i }));
+
+    await waitFor(() => expect(api.assignSpoolmanSlot).toHaveBeenCalled());
+    await waitFor(() => expect(slotsCall.mock.calls.length).toBeGreaterThan(before));
   });
 
   it('hides archived Spoolman spools', async () => {

@@ -1,13 +1,6 @@
-from datetime import datetime
-from typing import Annotated
+from pydantic import BaseModel, Field
 
-from pydantic import AfterValidator, BaseModel, Field
-
-from backend.app.schemas.print_queue import UTCDatetime
-from backend.app.utils.local_time import to_naive_utc
-
-# Coerces any client-sent UTC offset to the naive UTC the DB stores.
-NaiveUTCDatetime = Annotated[datetime | None, AfterValidator(to_naive_utc)]
+from backend.app.schemas.print_queue import NaiveUTCDatetime, UTCDatetime
 
 
 class ScheduledDryingCreate(BaseModel):
@@ -36,6 +29,7 @@ class ScheduledDryingResponse(BaseModel):
     status: str
     waiting_reason: str | None
     error_message: str | None
+    error_code: str | None = None
     created_at: UTCDatetime
     started_at: UTCDatetime
     completed_at: UTCDatetime

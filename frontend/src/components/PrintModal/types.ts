@@ -31,6 +31,12 @@ export interface PrintModalProps {
   queueItem?: PrintQueueItem;
   /** Pre-select specific printers when opening the modal */
   initialSelectedPrinterIds?: number[];
+  /**
+   * Pre-select this plate when opening the modal (create mode): a reprint of
+   * an archive, or a re-queue, prints the plate that job printed, not plate 1.
+   * A plate the file no longer has falls back to the first plate.
+   */
+  preselectPlateId?: number | null;
   /** Handler for closing the modal */
   onClose: () => void;
   /** Handler for successful operation */
@@ -66,6 +72,8 @@ export interface PrintOptions {
   layer_inspect: boolean;
   timelapse: boolean;
   nozzle_offset_cali: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome: boolean;
   // Per-item preheat / heat-soak override (#1468). 'inherit' uses the global
   // Settings → Workflow toggle; 'on' / 'off' force the per-print decision.
   // chamber_target_override is non-null to bypass the per-filament-type
@@ -84,6 +92,7 @@ export const DEFAULT_PRINT_OPTIONS: PrintOptions = {
   layer_inspect: false,
   timelapse: false,
   nozzle_offset_cali: 'auto',
+  confirm_outcome: false,
   preheat_override: 'inherit',
   preheat_chamber_target_override: null,
 };
@@ -325,4 +334,6 @@ export interface ScheduleOptionsProps {
   printerCount?: number;
   /** Whether G-code snippets are configured in settings */
   hasGcodeSnippets?: boolean;
+  /** The user's jobs wait for someone to start them (#1620) */
+  needsReview?: boolean;
 }

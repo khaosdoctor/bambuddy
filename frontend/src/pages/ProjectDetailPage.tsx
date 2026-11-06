@@ -48,6 +48,8 @@ import { PrintModal } from '../components/PrintModal';
 import { ProjectModal } from './ProjectsPage';
 import { getCurrencySymbol } from '../utils/currency';
 import { isSlicedLibraryFile } from '../utils/libraryFiles';
+import { NumberInput } from '../components/NumberInput';
+import { useUiSettings } from '../hooks/useUiSettings';
 
 function formatFilament(grams: number): string {
   if (grams >= 1000) {
@@ -127,7 +129,7 @@ function ArchiveGrid({ archives, t }: { archives: Archive[]; t: TFunction }) {
       {archives.map((archive) => (
         <Link
           key={archive.id}
-          to={`/archives?search=${encodeURIComponent(archive.print_name || '')}`}
+          to={`/archives?highlight=${archive.id}`}
           className="group relative aspect-square rounded-lg bg-bambu-dark border border-bambu-dark-tertiary overflow-hidden hover:border-bambu-green transition-colors"
         >
           {archive.thumbnail_path ? (
@@ -232,10 +234,7 @@ export function ProjectDetailPage() {
     enabled: projectId > 0,
   });
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  const { data: settings } = useUiSettings();
 
   const { data: linkedFolders } = useQuery({
     queryKey: ['project-folders', projectId],
@@ -713,6 +712,7 @@ export function ProjectDetailPage() {
                 const rollupCost =
                   project.rollup_stats.estimated_cost +
                   project.rollup_stats.total_energy_cost +
+                  (project.rollup_stats.total_wear_cost ?? 0) +
                   project.rollup_stats.bom_cost;
                 if (rollupCost <= 0) return null;
                 return (
@@ -753,7 +753,7 @@ export function ProjectDetailPage() {
 
       {/* Cost tracking */}
       {stats && (() => {
-        const totalCost = stats.estimated_cost + stats.total_energy_cost + stats.bom_cost;
+        const totalCost = stats.estimated_cost + stats.total_energy_cost + (stats.total_wear_cost ?? 0) + stats.bom_cost;
         return (stats.estimated_cost > 0 || totalCost > 0 || project.budget !== null);
       })() && (
         <Card>
@@ -781,8 +781,16 @@ export function ProjectDetailPage() {
                   </p>
                 </div>
               )}
+              {(stats.total_wear_cost ?? 0) > 0 && (
+                <div>
+                  <p className="text-xs text-bambu-gray uppercase">{t('projectDetail.cost.wear')}</p>
+                  <p className="text-lg font-semibold text-white">
+                    {currency}{stats.total_wear_cost.toFixed(2)}
+                  </p>
+                </div>
+              )}
               {(() => {
-                const totalCost = stats.estimated_cost + stats.total_energy_cost + stats.bom_cost;
+                const totalCost = stats.estimated_cost + stats.total_energy_cost + (stats.total_wear_cost ?? 0) + stats.bom_cost;
                 if (totalCost <= 0) return null;
                 return (
                   <div>
@@ -797,7 +805,7 @@ export function ProjectDetailPage() {
                 );
               })()}
               {project.budget !== null && (() => {
-                const totalCost = stats.estimated_cost + stats.total_energy_cost + stats.bom_cost;
+                const totalCost = stats.estimated_cost + stats.total_energy_cost + (stats.total_wear_cost ?? 0) + stats.bom_cost;
                 const remaining = project.budget - totalCost;
                 return (
                   <div>
@@ -1205,12 +1213,12 @@ export function ProjectDetailPage() {
                   autoFocus
                 />
                 <div className="flex gap-2">
-                  <input
-                    type="number"
+                  <NumberInput
                     value={newBomQty}
-                    onChange={(e) => setNewBomQty(parseInt(e.target.value) || 1)}
+                    onChange={setNewBomQty}
+                    fallback={1}
                     className="w-20 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-bambu-green"
-                    min="1"
+                    min={1}
                     placeholder={t('projectDetail.bom.qty')}
                   />
                   <input
@@ -1280,12 +1288,12 @@ export function ProjectDetailPage() {
                           autoFocus
                         />
                         <div className="flex gap-2">
-                          <input
-                            type="number"
+                          <NumberInput
                             value={editBomQty}
-                            onChange={(e) => setEditBomQty(parseInt(e.target.value) || 1)}
+                            onChange={setEditBomQty}
+                            fallback={1}
                             className="w-20 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-bambu-green"
-                            min="1"
+                            min={1}
                             placeholder={t('projectDetail.bom.qty')}
                           />
                           <input

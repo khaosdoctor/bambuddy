@@ -1,9 +1,11 @@
+import { useEffect, useRef } from 'react';
 import { Layers, Check, AlertTriangle, Square, CheckSquare } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { PlateSelectorProps } from './types';
 import { formatDuration } from '../../utils/date';
 import { withMediaToken } from '../../api/client';
 import { getBedTypeInfo } from '../../utils/bedType';
+import { NumberInput } from '../NumberInput';
 
 /**
  * Plate selection grid for multi-plate 3MF files.
@@ -23,6 +25,17 @@ export function PlateSelector({
   onQuantityChange,
 }: PlateSelectorProps) {
   const { t } = useTranslation();
+  // A plate selected on opening (a reprint of plate 10, say) can be far down a
+  // long list: bring it into view once, when the cards first appear (#3395).
+  const firstSelectedRef = useRef<HTMLDivElement | null>(null);
+  const scrolled = useRef(false);
+  const visible = isMultiPlate && plates.length > 1;
+  useEffect(() => {
+    if (scrolled.current || !visible || !firstSelectedRef.current) return;
+    scrolled.current = true;
+    firstSelectedRef.current.scrollIntoView?.({ block: 'nearest' });
+  }, [visible, selectedPlates]);
+  const firstSelected = plates.find((p) => selectedPlates.has(p.index))?.index;
 
   // Only show for multi-plate files with multiple plates
   if (!isMultiPlate || plates.length <= 1) {
@@ -72,6 +85,7 @@ export function PlateSelector({
                region stays a button beside the stepper. */
             <div
               key={plate.index}
+              ref={plate.index === firstSelected ? firstSelectedRef : undefined}
               className={`flex items-center gap-2 p-2 rounded-lg border transition-colors ${
                 isSelected
                   ? 'border-bambu-green bg-bambu-green/10'
@@ -130,17 +144,15 @@ export function PlateSelector({
             {showQuantities && isSelected && (
               <div className="flex items-center gap-1 flex-shrink-0">
                 <span className="text-xs text-bambu-gray" aria-hidden="true">×</span>
-                <input
-                  type="number"
+                <NumberInput
                   min={1}
                   max={999}
                   value={quantities[plate.index] ?? 1}
                   aria-label={t('queue.plateQuantityLabel', {
                     plate: plate.name || t('queue.plateNumber', { index: plate.index }),
                   })}
-                  onChange={(e) =>
-                    onQuantityChange(plate.index, Math.max(1, Math.min(999, parseInt(e.target.value) || 1)))
-                  }
+                  onChange={(v) => onQuantityChange(plate.index, v)}
+                  fallback={1}
                   className="w-14 px-1.5 py-1 text-sm bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-center focus:outline-none focus:ring-1 focus:ring-bambu-green"
                 />
               </div>
